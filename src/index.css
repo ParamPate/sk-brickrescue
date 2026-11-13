@@ -154,13 +154,6 @@ body {
   margin: 0;
 }
 
-.brand-title img {
-  display: block;
-  width: 88px;
-  height: 88px;
-  object-fit: contain;
-}
-
 /* Main Layout Area */
 .main-content {
   flex: 1;

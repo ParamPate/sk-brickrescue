@@ -1,5 +1,5 @@
 {
-  "name": "brickrelic",
+  "name": "sk-brickhouse",
   "private": true,
   "version": "0.12.0",
   "description": "AI LEGO brick scanner and set identifier — point your camera at scattered bricks and discover matching sets via color analysis and part recognition. Fully client-side.",
@@ -17,9 +17,9 @@
   "license": "AGPL-3.0-or-later",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/frank3ling/brick-relic.git"
+    "url": "git+https://github.com/ParamPate/sk-brickrescue.git"
   },
-  "homepage": "https://github.com/frank3ling/brick-relic#readme",
+  "homepage": "https://github.com/ParamPate/sk-brickrescue#readme",
   "type": "module",
   "scripts": {
     "dev": "vite",

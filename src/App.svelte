@@ -144,7 +144,7 @@
     <header class="app-header">
       <button class="header-back-btn" onclick={handleReset}>Reset scan</button>
 
-      <h1 class="brand-title"><img src="/brickrescue-logo.png" alt="SK BrickRescue" /></h1>
+      <h1 class="brand-title">SK Brickhouse</h1>
 
       <!-- Right Spacer (keeps title centered) -->
       <div class="header-actions"></div>

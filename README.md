@@ -1,8 +1,8 @@
 <div align="center">
 
-<img src="./public/logo.svg" width="88" height="88" alt="BrickRelic Logo" />
+<img src="./public/logo.svg" width="88" height="88" alt="SK Brickhouse Logo" />
 
-# BrickRelic
+# SK Brickhouse
 
 [![Svelte 5](https://img.shields.io/badge/Svelte-5-FF3E00?logo=svelte&logoColor=white)](https://svelte.dev)
 [![Vite](https://img.shields.io/badge/Vite-8-646CFF?logo=vite&logoColor=white)](https://vite.dev)
@@ -17,15 +17,16 @@ By analyzing dominant color distributions and scanning diagnostic key parts, the
 
 ---
 
-BrickRelic is a free, browser-based **LEGO set identifier** and **AI brick scanner** for **AFOLs (Adult Fans of LEGO)** — point your camera at a pile of mixed bricks and instantly see which sets they belong to. The perfect **LEGO sorting tool** for flea market hauls and inherited collections.
+SK Brickhouse is a browser-based LEGO® part scanner and set finder. Param Patel developed the SK Brickhouse photo-scanning workflow and interface, building on [BrickRelic by frank3ling](https://github.com/frank3ling/brick-relic).
 
 ## ✨ Features
 
+- **Photo scanning**: Upload a photo to detect and crop multiple pieces. Review numbered boxes and unidentified crops, correct colors, and adjust quantities.
 - 📸 **Live Camera Feed & Tap-to-Scan**: Use your smartphone's rear camera (with an automatic webcam fallback on laptops). Tap the viewfinder to freeze a frame and classify the part via the Brickognize API.
 - 🎨 **Color Profile Analysis**: Real-time extraction of the dominant color distribution of the scanned brick heap, used as weights for matching.
 - 🎯 **Set Radar**: A dynamic, live-ranked probability list of potential matching sets, re-sorted after every color scan and part detection.
 - ⛏️ **Excavation Mode (Dig Mode)**: Guided search for a specific set with an interactive checklist of its diagnostic key parts — mark parts as "Uncovered" to boost the set's match score.
-- 🗄️ **Fully Client-Side**: All catalog matching runs in-memory in the browser. No backend server, no database, no tracking. Only the tap-to-scan part recognition calls the external Brickognize API.
+- 🗄️ **Fully Client-Side**: All catalog matching runs in-memory in the browser. No backend server, no database, no tracking. Part recognition sends individual crops or camera captures to the Brickognize API.
 
 ---
 
@@ -43,9 +44,9 @@ BrickRelic is a free, browser-based **LEGO set identifier** and **AI brick scann
 
 ### 1. Clone Repository & Install Dependencies
 ```bash
-git clone https://github.com/frank3ling/brick-relic.git
-cd brick-relic
-npm install
+git clone https://github.com/ParamPate/sk-brickrescue.git
+cd sk-brickrescue
+npm ci
 ```
 *Note: The repository's `.npmrc` enables `legacy-peer-deps` automatically to resolve peer dependency warnings from bleeding-edge Vite versions — no extra flag needed.*
 
@@ -119,4 +120,4 @@ Browsers only allow camera access in a secure context: use `https://` (or `local
 
 ## ⚠️ Trademark Legal Disclaimer
 
-BrickRelic is an unofficial, independent fan project. **LEGO®** is a trademark of the LEGO Group of companies. This software, project, and its developers are **NOT** affiliated with, authorized, sponsored, associated, or endorsed by the LEGO Group. All trademark references are used strictly for compatibility description purposes.
+SK Brickhouse is an unofficial, independent fan project. **LEGO®** is a trademark of the LEGO Group of companies. This software, project, and its developers are **NOT** affiliated with, authorized, sponsored, associated, or endorsed by the LEGO Group. All trademark references are used strictly for compatibility description purposes.

@@ -6,7 +6,7 @@ If you do not have your own web server or hosting infrastructure, deploying to V
 
 ## 🚀 Deployment Process (Without Custom Infrastructure)
 
-To deploy BrickRelic to Vercel:
+To deploy SK Brickhouse to Vercel:
 1. **Fork the Repository**: Fork this repository to your own GitHub account.
 2. **Import to Vercel**:
    * Go to the Vercel Dashboard and click **Add New** > **Project**.

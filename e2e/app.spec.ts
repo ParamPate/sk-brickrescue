@@ -26,7 +26,7 @@ async function enterScanner(page: Page) {
 
 test("opens the branded scanner directly with the camera off", async ({ page }) => {
   await page.goto("/");
-  await expect(page.getByRole("heading", { name: "SK BrickRescue" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "SK Brickhouse" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Scan Photo" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Start Camera" })).toBeVisible();
   await expect(page.locator("video.camera-video")).toBeHidden();
