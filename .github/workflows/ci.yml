@@ -42,7 +42,7 @@ jobs:
     # dumps on every push (key rotates when the generator changes).
     - name: Restore catalog cache
       id: catalog-cache
-      uses: actions/cache@v4
+      uses: actions/cache@v6
       with:
         path: public/catalog
         key: catalog-${{ hashFiles('scripts/generate-local-catalog.ts') }}
