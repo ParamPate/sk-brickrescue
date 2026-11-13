@@ -18,23 +18,18 @@ async function mockBrickognize(page: Page, items: unknown[] = [SCANNED_PART]) {
 
 async function enterScanner(page: Page) {
   await page.goto("/");
-  await page.getByRole("button", { name: "Unearth Relics" }).click();
+  await page.getByRole("button", { name: "Start Camera" }).click();
   // Fake camera device: wait until the stream is live (video shown, HUD hint visible)
   await expect(page.locator("video.camera-video:not(.hidden)")).toBeVisible({ timeout: 15_000 });
   await expect(page.locator(".hud-hint")).toContainText("Tap to scan");
 }
 
-test("start screen shows branding, database version, and legal footer (REQ-START-001/002)", async ({ page }) => {
+test("opens the branded scanner directly with the camera off", async ({ page }) => {
   await page.goto("/");
-
-  await expect(page.locator(".start-title")).toHaveText("BrickRelic");
-  await expect(page.getByRole("button", { name: "Unearth Relics" })).toBeVisible();
-  // Database version derived from catalog/meta.json (fallback label is "Rebrickable Catalog")
-  await expect(page.locator(".start-footer")).toContainText(/Database: Rebrickable Catalog v\d{4}/);
-  await expect(page.locator(".start-disclaimer")).toContainText("LEGO® is a trademark");
-  await expect(page.locator(".start-footer-credits")).toContainText("Rebrickable");
-  // Camera must NOT be active on the start screen (REQ-SYS-003)
-  await expect(page.locator("video")).toHaveCount(0);
+  await expect(page.getByRole("heading", { name: "SK BrickRescue" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Scan Photo" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Start Camera" })).toBeVisible();
+  await expect(page.locator("video.camera-video")).toBeHidden();
 });
 
 test("tap-to-scan adds the recognized part to the Found Shelf and populates the radar (REQ-RAD-003/004/005)", async ({ page }) => {
@@ -72,12 +67,12 @@ test("excavation mode: unearth boosts progress, found badge un-marks, set stays 
   // Dig panel with hero, progress gauge and found-first checklist
   await expect(page.locator(".dig-panel")).toBeVisible();
   await expect(page.locator(".dig-progress-header")).toContainText("Key artifacts unearthed");
-  const unearthButtons = page.locator(".btn-action", { hasText: "Unearth" });
-  await expect(unearthButtons.first()).toBeVisible({ timeout: 15_000 });
+  const markFoundButtons = page.locator(".btn-action", { hasText: "Found" });
+  await expect(markFoundButtons.first()).toBeVisible({ timeout: 15_000 });
 
-  // Unearth one part → it flips to the green Found state; the set stays open
+  // Mark one part as found → it flips to the green Found state; the set stays open
   // even though the re-match may change the top 3 (FIND-033 regression)
-  await unearthButtons.first().click();
+  await markFoundButtons.first().click();
   await expect(page.locator(".badge-found").first()).toBeVisible({ timeout: 10_000 });
   await expect(page.locator(".dig-panel")).toBeVisible();
 
@@ -88,23 +83,20 @@ test("excavation mode: unearth boosts progress, found badge un-marks, set stays 
   await expect(page.locator(".dig-panel")).toBeVisible();
 });
 
-test("header back button resets all search progress (REQ-START-003)", async ({ page }) => {
+test("Reset scan clears search progress", async ({ page }) => {
   await mockBrickognize(page);
   await enterScanner(page);
 
   await page.locator(".scanner-viewport").click({ position: { x: 150, y: 150 } });
   await expect(page.locator(".found-item-card")).toHaveCount(1, { timeout: 10_000 });
 
-  await page.locator(".header-back-btn").click();
-  await expect(page.getByRole("button", { name: "Unearth Relics" })).toBeVisible();
-
-  // Re-entering shows a clean slate
-  await page.getByRole("button", { name: "Unearth Relics" }).click();
+  await page.getByRole("button", { name: "Reset scan" }).click();
+  await expect(page.getByRole("button", { name: "Start Camera" })).toBeVisible();
   await expect(page.locator(".found-item-card")).toHaveCount(0);
   await expect(page.locator(".found-items-empty")).toBeVisible();
 });
 
-test("scanned shelf with many parts never overflows the page horizontally (FIND-047)", async ({ page }) => {
+test("scanned bricks with long names never overflow the page horizontally (FIND-047)", async ({ page }) => {
   // Return a DIFFERENT part on each call so scans don't dedupe — fills the shelf past its width.
   let n = 0;
   await page.route("https://api.brickognize.com/**", (route) => {
@@ -132,4 +124,40 @@ test("scanned shelf with many parts never overflows the page horizontally (FIND-
   }));
   expect(appW).toBeLessThanOrEqual(winW);
   expect(docScrollW).toBeLessThanOrEqual(winW);
+});
+
+test("photo scanning works with camera access denied", async ({ page }) => {
+  await page.addInitScript(() => {
+    navigator.mediaDevices.getUserMedia = async () => {
+      throw new DOMException("Camera denied", "NotAllowedError");
+    };
+  });
+  await mockBrickognize(page);
+  await page.goto("/");
+  await expect(page.getByRole("button", { name: "Start Camera" })).toBeVisible();
+
+  const image = await page.evaluate(() => {
+    const canvas = document.createElement("canvas");
+    canvas.width = canvas.height = 100;
+    const ctx = canvas.getContext("2d")!;
+    ctx.fillStyle = "red";
+    ctx.fillRect(0, 0, 100, 100);
+    return canvas.toDataURL("image/png").split(",")[1];
+  });
+  const input = page.locator('input[type="file"]');
+  await input.setInputFiles({
+    name: "invalid.png",
+    mimeType: "image/png",
+    buffer: Buffer.from("invalid image")
+  });
+  await expect(page.getByRole("status")).toContainText("Could not read that photo");
+  await input.setInputFiles({
+    name: "brick.png",
+    mimeType: "image/png",
+    buffer: Buffer.from(image, "base64")
+  });
+
+  await expect(page.locator(".found-item-name")).toHaveText("Brick 2 x 4");
+  await expect(page.locator(".color-bar")).toHaveCount(1);
+  await expect(page.locator(".radar-set-card").first()).toBeVisible();
 });

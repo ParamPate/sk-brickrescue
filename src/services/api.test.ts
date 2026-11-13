@@ -378,6 +378,7 @@ describe("BrickRelic - Brickognize API Hardening", () => {
     vi.stubGlobal("fetch", vi.fn(() => Promise.resolve({
       ok: true,
       json: () => Promise.resolve({
+        listing_id: "res-d492bca0",
         items: [
           { id: "3001", name: "Brick 2 x 4", score: "0.92", img_url: "https://cdn.example.com/3001.png" },
           { id: "3002", name: "Brick 2 x 2", score: 0.5, img_url: "http://insecure.example.com/3002.png" },
@@ -390,6 +391,7 @@ describe("BrickRelic - Brickognize API Hardening", () => {
 
     const parts = await predictPartFromImage(makeBlob());
     expect(parts.map(p => p.part_num)).toEqual(["3001", "3002"]);
+    expect(parts[0].brickognizeUrl).toBe("https://brickognize.com/results/res-d492bca0/");
     expect(parts[0].imageUrl).toBe("https://cdn.example.com/3001.png");
     expect(parts[0].rarity_score).toBeCloseTo(0.92);
     expect(parts[1].imageUrl).toBe(""); // http:// URL dropped

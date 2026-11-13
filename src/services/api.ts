@@ -291,6 +291,11 @@ export async function predictPartFromImage(imageBlob: Blob): Promise<BrickPart[]
   const data = await res.json();
   if (!data || !Array.isArray(data.items)) return [];
 
+  const listingId = data.listing_id;
+  const brickognizeUrl = typeof listingId === "string" && /^[a-z0-9-]+$/i.test(listingId)
+    ? `https://brickognize.com/results/${listingId}/`
+    : undefined;
+
   return data.items
     .filter((item: unknown): item is { id: string; name: string; score?: unknown; img_url?: unknown } => {
       const candidate = item as { id?: unknown; name?: unknown };
@@ -298,6 +303,7 @@ export async function predictPartFromImage(imageBlob: Blob): Promise<BrickPart[]
     })
     .map((item: { id: string; name: string; score?: unknown; img_url?: unknown }): BrickPart => ({
       part_num: item.id,
+      brickognizeUrl,
       name: item.name,
       color_id: 15, // Placeholder — caller overrides with the dominant scanned color
       rarity_score: parseFloat(String(item.score)) || 0.1,

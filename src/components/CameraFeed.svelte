@@ -1,5 +1,7 @@
 <script lang="ts">
+  import { onDestroy } from "svelte";
   import type { BrickPart, ScannedColorInput } from "../services/types";
+  import { findPhotoParts } from "../services/photoParts";
   import { predictPartFromImage } from "../services/api";
   import { loadColors, resolveColor } from "../services/catalog.svelte";
   import { buildRgbLookup, analyzeDominantColors, sameDominantColors, type RgbLookupEntry } from "../services/colorAnalyzer";
@@ -36,7 +38,19 @@
   let showFlash = $state<boolean>(false);
   let tapPosition = $state<{ x: number; y: number } | null>(null);
   let activeStream = $state<MediaStream | null>(null);
-  let isCameraRequested = $state<boolean>(true);
+  let isCameraRequested = $state(false);
+  let destroyed = false;
+  let photoPreview = $state("");
+  let photoBoxes = $state<{ left: number; top: number; width: number; height: number }[]>([]);
+  let unidentified = $state<{ box: number; imageUrl: string; requestFailed: boolean }[]>([]);
+  let activePhotoBox = $state(-1);
+  onDestroy(() => {
+    destroyed = true;
+    URL.revokeObjectURL(photoPreview);
+  });
+
+  let photoProgress = $state("");
+  let photoInput = $state<HTMLInputElement>();
   let scanFeedback = $state<string | null>(null);
   let scanFeedbackTimeout: ReturnType<typeof setTimeout> | null = null;
 
@@ -59,6 +73,7 @@
       return;
     }
 
+    let cancelled = false;
     let activeStreamInstance: MediaStream | null = null;
 
     async function startCamera() {
@@ -73,6 +88,7 @@
             audio: false,
           });
         } catch (envErr) {
+          if (cancelled) return;
           console.warn("Rear camera not available, trying default camera (webcam)...", envErr);
           // Versuch 2: Beliebige Kamera (Laptop-Webcam)
           stream = await navigator.mediaDevices.getUserMedia({
@@ -81,6 +97,10 @@
           });
         }
 
+        if (cancelled) {
+          stream.getTracks().forEach((track) => track.stop());
+          return;
+        }
         activeStreamInstance = stream;
         activeStream = stream;
         streamActive = true;
@@ -93,7 +113,8 @@
             if (videoElement) videoElement.srcObject = stream;
           }, 50);
         }
-      } catch (err: any) {
+      } catch (err) {
+        if (cancelled) return;
         console.warn("Camera could not be started.", err);
         cameraError = "Enable camera in settings to scan.";
         streamActive = false;
@@ -104,6 +125,7 @@
     startCamera();
 
     return () => {
+      cancelled = true;
       if (activeStreamInstance) {
         activeStreamInstance.getTracks().forEach((track) => track.stop());
       }
@@ -112,7 +134,7 @@
 
   // Reset colors if camera is stopped
   $effect(() => {
-    if (!streamActive) {
+    if (!streamActive && isCameraRequested) {
       scannedColors = [];
     }
   });
@@ -144,6 +166,149 @@
     return () => clearInterval(interval);
   });
 
+  async function recognize(canvas: HTMLCanvasElement, colorId: number, useCrop = false) {
+    const blob = await new Promise<Blob | null>((resolve) =>
+      canvas.toBlob(resolve, "image/jpeg", CAPTURE_JPEG_QUALITY)
+    );
+    if (!blob) throw new Error("Could not encode scan image");
+
+    const [detectedPart] = await predictPartFromImage(blob);
+    if (!detectedPart || destroyed) return false;
+    onPartIdentified({
+      ...detectedPart,
+      color_id: colorId,
+      imageUrl: useCrop ? canvas.toDataURL("image/jpeg", 0.7) : detectedPart.imageUrl
+    });
+    return true;
+  }
+
+  async function classifyCapture(canvas: HTMLCanvasElement, useCrop = false) {
+    try {
+      if (!await recognize(canvas, scannedColors[0]?.color_id ?? DEFAULT_COLOR_ID, useCrop)) {
+        showScanFeedback("No part recognized. Try a close-up of one brick.");
+      }
+    } catch (err) {
+      console.error("Error in Brickognize classification:", err);
+      showScanFeedback("Scan failed. Check your connection and try again.");
+    } finally {
+      isFrozen = false;
+      tapPosition = null;
+    }
+  }
+
+  async function scanPhoto(event: Event) {
+    const input = event.currentTarget as HTMLInputElement;
+    const file = input.files?.[0];
+    input.value = "";
+    if (!file || isFrozen) return;
+
+    isFrozen = true;
+    scanFeedback = null;
+    photoProgress = "";
+    activePhotoBox = -1;
+    try {
+      const image = await createImageBitmap(file);
+      const canvas = document.createElement("canvas");
+      try {
+        const scale = Math.min(1, 2048 / Math.max(image.width, image.height));
+        canvas.width = Math.max(1, Math.round(image.width * scale));
+        canvas.height = Math.max(1, Math.round(image.height * scale));
+        const ctx = canvas.getContext("2d");
+        if (!ctx) throw new Error("Could not get 2D context from canvas");
+        ctx.fillStyle = "white";
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
+      } finally {
+        image.close();
+      }
+
+      if (destroyed) return;
+      URL.revokeObjectURL(photoPreview);
+      photoPreview = URL.createObjectURL(file);
+      photoBoxes = [];
+      unidentified = [];
+
+      const detection = document.createElement("canvas");
+      const scale = Math.min(1, 800 / Math.max(canvas.width, canvas.height));
+      detection.width = Math.max(1, Math.round(canvas.width * scale));
+      detection.height = Math.max(1, Math.round(canvas.height * scale));
+      const detector = detection.getContext("2d", { willReadFrequently: true });
+      if (!detector) throw new Error("Could not get 2D context for detecting pieces");
+      detector.drawImage(canvas, 0, 0, detection.width, detection.height);
+      const parts = findPhotoParts(detector.getImageData(0, 0, detection.width, detection.height));
+      photoBoxes = parts.map((part) => ({
+        left: part.left / detection.width * 100,
+        top: part.top / detection.height * 100,
+        width: (part.right - part.left + 1) / detection.width * 100,
+        height: (part.bottom - part.top + 1) / detection.height * 100
+      }));
+      const lookup = buildRgbLookup(await loadColors());
+      isCameraRequested = false;
+      cameraError = null;
+
+      if (parts.length > 1) {
+        const pixels = new Uint8ClampedArray(parts.reduce((size, part) => size + part.pixels.length, 0));
+        let offset = 0;
+        for (const part of parts) {
+          pixels.set(part.pixels, offset);
+          offset += part.pixels.length;
+        }
+        scannedColors = analyzeDominantColors(pixels, lookup);
+        const crop = document.createElement("canvas");
+        const cropCtx = crop.getContext("2d");
+        if (!cropCtx) throw new Error("Could not get 2D context for cropping pieces");
+        const xScale = canvas.width / detection.width;
+        const yScale = canvas.height / detection.height;
+        let recognized = 0;
+        let failed = 0;
+        for (const [index, part] of parts.entries()) {
+          if (destroyed) return;
+          activePhotoBox = index;
+          photoProgress = `Scanning piece ${index + 1} of ${parts.length}…`;
+          const left = Math.max(0, Math.floor((part.left - 5) * xScale));
+          const top = Math.max(0, Math.floor((part.top - 5) * yScale));
+          crop.width = Math.min(canvas.width, Math.ceil((part.right + 6) * xScale)) - left;
+          crop.height = Math.min(canvas.height, Math.ceil((part.bottom + 6) * yScale)) - top;
+          cropCtx.drawImage(canvas, left, top, crop.width, crop.height, 0, 0, crop.width, crop.height);
+          const colorId = analyzeDominantColors(part.pixels, lookup)[0]?.color_id ?? DEFAULT_COLOR_ID;
+          try {
+            if (await recognize(crop, colorId, true)) {
+              recognized++;
+            } else if (!destroyed) {
+              unidentified.push({ box: index + 1, imageUrl: crop.toDataURL("image/jpeg", 0.7), requestFailed: false });
+            }
+          } catch (err) {
+            console.error("Error identifying photo crop:", err);
+            failed++;
+            if (!destroyed) {
+              unidentified.push({ box: index + 1, imageUrl: crop.toDataURL("image/jpeg", 0.7), requestFailed: true });
+            }
+          }
+        }
+        photoProgress = `Recognized ${recognized} of ${parts.length} detected pieces.` +
+          (unidentified.length ? ` ${unidentified.length} unidentified.` : "") +
+          (failed ? ` ${failed} requests failed.` : "");
+        return;
+      }
+
+      const sample = canvasElement;
+      const sampleCtx = sample?.getContext("2d");
+      if (!sample || !sampleCtx) throw new Error("Could not get 2D context from sample canvas");
+      sampleCtx.drawImage(canvas, 0, 0, sample.width, sample.height);
+      scannedColors = analyzeDominantColors(
+        sampleCtx.getImageData(0, 0, sample.width, sample.height).data,
+        lookup
+      );
+      await classifyCapture(canvas, true);
+    } catch (err) {
+      console.error("Error preparing scan photo:", err);
+      showScanFeedback("Could not read that photo. Try a JPEG or PNG.");
+    } finally {
+      activePhotoBox = -1;
+      isFrozen = false;
+    }
+  }
+
   // Core capture and classification logic
   const triggerCapture = async (clickX?: number, clickY?: number) => {
     if (isFrozen) return;
@@ -174,33 +339,7 @@
 
         ctx.drawImage(videoElement, 0, 0, canvas.width, canvas.height);
 
-        canvas.toBlob(async (blob) => {
-          if (!blob) {
-            isFrozen = false;
-            tapPosition = null;
-            return;
-          }
-
-          try {
-            const detectedParts = await predictPartFromImage(blob);
-            if (detectedParts.length > 0) {
-              const detectedPart = detectedParts[0];
-              // Use dominant scanned color or default white
-              const primaryColorId = scannedColors.length > 0 ? scannedColors[0].color_id : DEFAULT_COLOR_ID;
-              detectedPart.color_id = primaryColorId;
-
-              onPartIdentified(detectedPart);
-            } else {
-              showScanFeedback("No part recognized — try again closer to the brick.");
-            }
-          } catch (err) {
-            console.error("Error in Brickognize classification:", err);
-            showScanFeedback("Scan failed — check your connection and try again.");
-          } finally {
-            isFrozen = false;
-            tapPosition = null;
-          }
-        }, "image/jpeg", CAPTURE_JPEG_QUALITY);
+        await classifyCapture(canvas);
       } catch (err) {
         console.error("Error during image capture:", err);
         isFrozen = false;
@@ -223,7 +362,7 @@
   // Handle keydown for Spacebar (to trigger scan on desktop webcams)
   const handleKeyDown = (e: KeyboardEvent) => {
     if (!streamActive || isFrozen) return;
-    if (e.code === "Space") {
+    if (e.code === "Space" && !(e.target instanceof HTMLElement && e.target.closest("button, input, a"))) {
       e.preventDefault(); // Prevent page scrolling
       triggerCapture();
     }
@@ -232,10 +371,27 @@
 
 <svelte:window onkeydown={handleKeyDown} />
 
-<div class="main-content">
+<section class="main-content" aria-label="Scanner">
+  <div class="photo-scan">
+    <input bind:this={photoInput} type="file" accept="image/*" hidden onchange={scanPhoto} />
+    <button class="activate-camera-btn" disabled={isFrozen} onclick={() => photoInput?.click()}>
+      Scan Photo
+    </button>
+    {#if !streamActive && !isCameraRequested}
+      <button class="camera-button" disabled={isFrozen} onclick={() => {
+        photoProgress = "";
+        isCameraRequested = true;
+      }}>Start Camera</button>
+    {/if}
+    <p>Use a close-up or spread pieces apart on a plain, light surface. Brickognize receives images of the pieces for identification.</p>
+    {#if !streamActive}
+      <div role="status">{photoProgress || (isFrozen ? "Processing image..." : scanFeedback ?? "")}</div>
+    {/if}
+  </div>
+
   <!-- svelte-ignore a11y_click_events_have_key_events -->
   <!-- svelte-ignore a11y_no_static_element_interactions -->
-  <div class="scanner-viewport" onclick={handleViewportClick} style="cursor: {isFrozen ? 'default' : 'crosshair'}">
+  <div class="scanner-viewport" class:photo-viewport={!streamActive && !!photoPreview && !isCameraRequested} onclick={handleViewportClick} style="cursor: {streamActive && !isFrozen ? 'crosshair' : 'default'}">
     <video
       bind:this={videoElement}
       autoplay
@@ -246,7 +402,19 @@
       <track kind="captions" />
     </video>
 
-    {#if !streamActive}
+    {#if !streamActive && photoPreview && !isCameraRequested}
+      <img class="photo-preview" src={photoPreview} alt="LEGO pieces selected for scanning" />
+      <div class="photo-boxes" aria-hidden="true">
+        {#each photoBoxes as box, index}
+          <div class="photo-box" class:active={index === activePhotoBox}
+            class:unidentified={unidentified.some((piece) => piece.box === index + 1)}
+            style:left={box.left + "%"} style:top={box.top + "%"}
+            style:width={box.width + "%"} style:height={box.height + "%"}>
+            <span>{index + 1}</span>
+          </div>
+        {/each}
+      </div>
+    {:else if !streamActive}
       <div class="camera-fallback-container">
         {#if isCameraRequested && !cameraError}
           <div class="camera-fallback-icon fallback-pulse" style="color: var(--primary)">
@@ -266,12 +434,9 @@
           {:else}
             <div class="camera-fallback-title">Ready to scan</div>
             <div class="camera-fallback-desc">
-              Tap to start scanning — we'll ask for camera access.
+              Upload a photo or start the camera.
             </div>
           {/if}
-          <button class="activate-camera-btn" onclick={() => { isCameraRequested = true; }}>
-            Start Camera
-          </button>
         {/if}
       </div>
     {/if}
@@ -315,6 +480,23 @@
     {/if}
   </div>
 
+  {#if unidentified.length && !streamActive}
+    <details class="unidentified-pieces">
+      <summary>Review unidentified pieces ({unidentified.length})</summary>
+      <ul>
+        {#each unidentified as piece (piece.box)}
+          <li>
+            <a href={piece.imageUrl} download={`piece-${piece.box}.jpg`}>
+              <img src={piece.imageUrl} alt={`Piece ${piece.box}`} />
+              <span>Box {piece.box}</span>
+            </a>
+            <span>{piece.requestFailed ? "Request failed" : "No match returned"}</span>
+          </li>
+        {/each}
+      </ul>
+    </details>
+  {/if}
+
   <!-- Color Profile Bar -->
   <div class="color-profile-panel">
     <div class="color-profile-header">
@@ -344,8 +526,104 @@
       </div>
     {:else}
       <div class="color-profile-empty">
-        Move camera over bricks to detect colors.
+        Scan a photo or move the camera over bricks to detect colors.
       </div>
     {/if}
   </div>
-</div>
+</section>
+
+<style>
+  .photo-scan {
+    padding: 0.75rem 1rem;
+    text-align: left;
+  }
+
+  .photo-scan .activate-camera-btn {
+    margin-top: 0;
+  }
+
+  .camera-button {
+    margin-left: 0.5rem;
+    padding: 9px 12px;
+    border: 1px solid var(--border-glass);
+    border-radius: var(--radius-md);
+    color: var(--text-primary);
+    background: var(--bg-elevated);
+    font: inherit;
+    cursor: pointer;
+  }
+
+  .scanner-viewport.photo-viewport {
+    aspect-ratio: auto;
+  }
+
+  .photo-preview {
+    display: block;
+    width: 100%;
+    height: auto;
+  }
+
+  .photo-boxes {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+  }
+
+  .photo-box {
+    position: absolute;
+    border: 2px solid #36563f;
+    box-shadow: 0 0 0 1px #fff;
+    border-radius: 3px;
+  }
+
+  .photo-box span {
+    position: absolute;
+    bottom: 100%;
+    left: -2px;
+    padding: 0 3px;
+    color: #fff;
+    background: #36563f;
+    font-size: 0.65rem;
+  }
+
+  .photo-box.unidentified {
+    border: 2px dashed #a83b37;
+  }
+
+  .photo-box.unidentified span {
+    background: #a83b37;
+  }
+
+  .unidentified-pieces {
+    padding: 12px 16px;
+  }
+
+  .unidentified-pieces ul {
+    list-style: none;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
+    gap: 8px;
+    margin-top: 8px;
+  }
+
+  .unidentified-pieces li {
+    font-size: 0.8rem;
+  }
+
+  .unidentified-pieces img {
+    display: block;
+    width: 100%;
+    height: 75px;
+    object-fit: contain;
+  }
+
+  .photo-box.active {
+    border-color: #e4ad3a;
+    z-index: 1;
+  }
+
+  .photo-scan p {
+    margin: 0.5rem 0 0;
+    font-size: 0.875rem;
+  }
+</style>

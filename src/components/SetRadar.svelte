@@ -12,17 +12,14 @@
 
 <div class="radar-panel">
   <div class="radar-header">
-    <span class="panel-section-title">
-      Relic Radar
-    </span>
+    <h2 class="panel-section-title">Set Matches</h2>
   </div>
 
   <div class="radar-list">
     {#each results.slice(0, 3) as res (res.set_num)}
       {@const percent = Math.round(res.combinedScore * 100)}
-      <!-- svelte-ignore a11y_click_events_have_key_events -->
-      <!-- svelte-ignore a11y_no_static_element_interactions -->
-      <div
+      <button
+        type="button"
         class="radar-set-card"
         onclick={() => onSelectSet(res.set_num)}
       >
@@ -47,10 +44,10 @@
           <span class="radar-score-percent-large">{percent}%</span>
           <span class="radar-score-label-small">Match</span>
         </div>
-      </div>
+      </button>
     {:else}
       <div class="radar-empty-state">
-        No matching sets found. Scan parts or adjust colour distribution.
+        Scan bricks to see matching sets.
       </div>
     {/each}
   </div>
