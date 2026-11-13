@@ -1,0 +1,25 @@
+name: Auto-Close Pull Requests
+
+on:
+  pull_request_target:
+    types: [opened, reopened]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  close-pr:
+    # Dependabot update PRs stay open as reminders; apply the bump upstream,
+    # then Dependabot closes its own PR once the update lands on main.
+    if: github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Close Pull Request
+        run: |
+          gh pr comment "$PR_NUMBER" --body "$COMMENT" --repo "$GITHUB_REPOSITORY"
+          gh pr close "$PR_NUMBER" --repo "$GITHUB_REPOSITORY"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          COMMENT: "This repository does not accept external pull requests or contributions. This pull request has been automatically closed. Please refer to CONTRIBUTING.md for details."

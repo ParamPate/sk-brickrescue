@@ -1,0 +1,55 @@
+name: Automated Semantic Release
+
+# Läuft erst, nachdem das CI Quality Gate auf main erfolgreich war.
+# Die Qualitäts-Checks (svelte-check, lint, test) macht CI — hier nicht doppeln.
+on:
+  workflow_run:
+    workflows: ["CI Quality Gate"]
+    types:
+      - completed
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Nur bei grünem CI und nur für den main-Branch.
+    if: >-
+      ${{ github.event.workflow_run.conclusion == 'success' &&
+          github.event.workflow_run.head_branch == 'main' }}
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        # Genau den von CI validierten Commit auschecken.
+        ref: ${{ github.event.workflow_run.head_sha }}
+        fetch-depth: 0
+        persist-credentials: false
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version-file: '.nvmrc'
+        cache: 'npm'
+
+    - name: Install dependencies
+      run: npm ci
+
+    - name: Build application
+      run: npm run build
+
+    - name: Zip build output
+      run: zip -r brickrelic-release.zip dist/
+
+    - name: Run Semantic Release
+      uses: cycjimmy/semantic-release-action@v4
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

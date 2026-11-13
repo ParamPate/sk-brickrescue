@@ -1,0 +1,52 @@
+{
+  "name": "sk-brickhouse",
+  "private": true,
+  "version": "0.12.0",
+  "description": "AI LEGO brick scanner and set identifier — point your camera at scattered bricks and discover matching sets via color analysis and part recognition. Fully client-side.",
+  "keywords": [
+    "lego",
+    "brick-scanner",
+    "set-identifier",
+    "lego-sorting",
+    "svelte",
+    "rebrickable",
+    "brickognize",
+    "computer-vision",
+    "afol"
+  ],
+  "license": "AGPL-3.0-or-later",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ParamPate/sk-brickrescue.git"
+  },
+  "homepage": "https://github.com/ParamPate/sk-brickrescue#readme",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "catalog": "tsx scripts/generate-local-catalog.ts",
+    "build": "npm run catalog && npm run build:app",
+    "build:app": "tsc --noEmit && vite build",
+    "check": "svelte-check --tsconfig ./tsconfig.json",
+    "lint": "oxlint",
+    "test": "vitest run",
+    "e2e": "playwright test",
+    "coverage": "vitest run --coverage",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "svelte": "^5.16.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.61.1",
+    "@sveltejs/vite-plugin-svelte": "^4.0.0",
+    "@tsconfig/svelte": "^5.0.4",
+    "@types/node": "^24.13.2",
+    "@vitest/coverage-v8": "^4.1.10",
+    "oxlint": "^1.71.0",
+    "svelte-check": "^4.1.1",
+    "tsx": "^4.19.2",
+    "typescript": "~6.0.2",
+    "vite": "^8.1.1",
+    "vitest": "^4.1.10"
+  }
+}
