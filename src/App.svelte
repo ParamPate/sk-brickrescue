@@ -10,6 +10,7 @@
 
   let scannedColors = $state<ScannedColorInput[]>([]);
   let inspectedPart = $state<BrickPart | null>(null);
+  let selectedPhotoBox = $state<number | null>(null);
   let colorOptions = $state<Awaited<ReturnType<typeof loadColors>>>({});
   loadColors().then((colors) => { colorOptions = colors; });
   let sortedColors = $derived(Object.entries(colorOptions).sort(([, a], [, b]) => a.name.localeCompare(b.name)));
@@ -123,6 +124,7 @@
 
   const handleReset = () => {
     scanSession++;
+    selectedPhotoBox = null;
     foundParts = [];
     selectedSetNum = null;
     scannedColors = [];
@@ -156,6 +158,11 @@
       {#key scanSession}
         <CameraFeed
           bind:scannedColors
+          {selectedPhotoBox}
+          onSelectPhotoBox={(box) => {
+            selectedPhotoBox = box;
+            if (box) document.querySelector(".scanner-viewport")?.scrollIntoView({ behavior: "smooth", block: "center" });
+          }}
           onPartIdentified={(part) => handlePartIdentified(part, true)}
         />
       {/key}
@@ -183,15 +190,24 @@
                       <span class="found-item-name">{part.name}</span>
                       <!-- Disambiguate duplicate IDs by color. -->
                       <span class="found-item-meta">{part.part_num}</span>
-                      {#if part.photoBoxes.length}
-                        <span class="found-item-source">Photo box{part.photoBoxes.length > 1 ? "es" : ""}: #{part.photoBoxes.join(", #")}</span>
-                      {/if}
                       <span class="found-item-meta found-item-color">
                         <span class="color-dot" style:background-color={color.hex} aria-hidden="true"></span>
                         {color.name}
                       </span>
                     </div>
                   </button>
+                  {#if part.photoBoxes.length}
+                    <div class="photo-box-references" aria-label="Source photo boxes">
+                      {#each part.photoBoxes as box (box)}
+                        <button class="found-item-source" class:active={selectedPhotoBox === box}
+                          aria-pressed={selectedPhotoBox === box}
+                          onclick={() => {
+                            selectedPhotoBox = box;
+                            document.querySelector(".scanner-viewport")?.scrollIntoView({ behavior: "smooth", block: "center" });
+                          }}>Photo #{box}</button>
+                      {/each}
+                    </div>
+                  {/if}
                   <div class="part-quantity" role="group" aria-label={`Quantity for ${part.name}, ${color.name}`}>
                     <button type="button" disabled={part.quantity === 1}
                       onclick={() => { part.quantity--; }} aria-label="Decrease quantity">−</button>

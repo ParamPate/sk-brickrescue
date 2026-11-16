@@ -23,10 +23,14 @@
   interface Props {
     scannedColors: ScannedColorInput[];
     onPartIdentified: (part: BrickPart) => void;
+    selectedPhotoBox?: number | null;
+    onSelectPhotoBox?: (box: number | null) => void;
   }
   let {
     scannedColors = $bindable(),
-    onPartIdentified
+    onPartIdentified,
+    selectedPhotoBox = null,
+    onSelectPhotoBox = () => {}
   }: Props = $props();
 
   // --- STATE ---
@@ -207,6 +211,7 @@
     scanFeedback = null;
     photoProgress = "";
     activePhotoBox = -1;
+    onSelectPhotoBox(null);
     try {
       const image = await createImageBitmap(file);
       const canvas = document.createElement("canvas");
@@ -407,7 +412,7 @@
       <img class="photo-preview" src={photoPreview} alt="LEGO pieces selected for scanning" />
       <div class="photo-boxes" aria-hidden="true">
         {#each photoBoxes as box, index}
-          <div class="photo-box" class:active={index === activePhotoBox}
+          <div class="photo-box" class:active={index === activePhotoBox || selectedPhotoBox === index + 1}
             class:unidentified={unidentified.some((piece) => piece.box === index + 1)}
             style:left={box.left + "%"} style:top={box.top + "%"}
             style:width={box.width + "%"} style:height={box.height + "%"}>

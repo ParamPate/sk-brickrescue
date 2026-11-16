@@ -451,11 +451,24 @@ body {
 .found-item-source {
   width: fit-content;
   padding: 1px 6px;
+  border: 0;
   border-radius: 999px;
   background: #edf3eb;
   color: #36563f;
   font-size: 0.68rem;
   font-weight: 700;
+  cursor: pointer;
+}
+
+.found-item-source.active {
+  background: #36563f;
+  color: white;
+}
+
+.photo-box-references {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
 }
 
 .remove-item-btn {
