@@ -448,6 +448,16 @@ body {
   color: var(--text-muted);
 }
 
+.found-item-source {
+  width: fit-content;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: #edf3eb;
+  color: #36563f;
+  font-size: 0.68rem;
+  font-weight: 700;
+}
+
 .remove-item-btn {
   flex: 0 0 28px;
   margin-left: auto;

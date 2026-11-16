@@ -21,7 +21,7 @@
     inspectionDialog?.showModal();
   }
 
-  let foundParts = $state<(BrickPart & { quantity: number })[]>([]);
+  let foundParts = $state<(BrickPart & { quantity: number; photoBoxes: number[] })[]>([]);
   let totalPieces = $derived(foundParts.reduce((total, part) => total + part.quantity, 0));
   let selectedSetNum = $state<string | null>(null);
   let matchResults = $state<MatchResult[]>([]);
@@ -81,9 +81,10 @@
   const handlePartIdentified = (part: BrickPart, countRepeat = false) => {
     const existing = foundParts.find((entry) => partKey(entry) === partKey(part));
     if (!existing) {
-      foundParts.unshift({ ...part, quantity: 1 });
+      foundParts.unshift({ ...part, quantity: 1, photoBoxes: part.photoBox ? [part.photoBox] : [] });
     } else if (countRepeat) {
       existing.quantity++;
+      if (part.photoBox && !existing.photoBoxes.includes(part.photoBox)) existing.photoBoxes.push(part.photoBox);
     }
   };
 
@@ -182,6 +183,9 @@
                       <span class="found-item-name">{part.name}</span>
                       <!-- Disambiguate duplicate IDs by color. -->
                       <span class="found-item-meta">{part.part_num}</span>
+                      {#if part.photoBoxes.length}
+                        <span class="found-item-source">Photo box{part.photoBoxes.length > 1 ? "es" : ""}: #{part.photoBoxes.join(", #")}</span>
+                      {/if}
                       <span class="found-item-meta found-item-color">
                         <span class="color-dot" style:background-color={color.hex} aria-hidden="true"></span>
                         {color.name}

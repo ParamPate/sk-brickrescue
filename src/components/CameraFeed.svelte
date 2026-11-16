@@ -166,7 +166,7 @@
     return () => clearInterval(interval);
   });
 
-  async function recognize(canvas: HTMLCanvasElement, colorId: number, useCrop = false) {
+  async function recognize(canvas: HTMLCanvasElement, colorId: number, useCrop = false, photoBox?: number) {
     const blob = await new Promise<Blob | null>((resolve) =>
       canvas.toBlob(resolve, "image/jpeg", CAPTURE_JPEG_QUALITY)
     );
@@ -177,7 +177,8 @@
     onPartIdentified({
       ...detectedPart,
       color_id: colorId,
-      imageUrl: useCrop ? canvas.toDataURL("image/jpeg", 0.7) : detectedPart.imageUrl
+      imageUrl: useCrop ? canvas.toDataURL("image/jpeg", 0.7) : detectedPart.imageUrl,
+      photoBox
     });
     return true;
   }
@@ -246,7 +247,7 @@
       isCameraRequested = false;
       cameraError = null;
 
-      if (parts.length > 1) {
+      if (parts.length > 0) {
         const pixels = new Uint8ClampedArray(parts.reduce((size, part) => size + part.pixels.length, 0));
         let offset = 0;
         for (const part of parts) {
@@ -272,7 +273,7 @@
           cropCtx.drawImage(canvas, left, top, crop.width, crop.height, 0, 0, crop.width, crop.height);
           const colorId = analyzeDominantColors(part.pixels, lookup)[0]?.color_id ?? DEFAULT_COLOR_ID;
           try {
-            if (await recognize(crop, colorId, true)) {
+            if (await recognize(crop, colorId, true, index + 1)) {
               recognized++;
             } else if (!destroyed) {
               unidentified.push({ box: index + 1, imageUrl: crop.toDataURL("image/jpeg", 0.7), requestFailed: false });

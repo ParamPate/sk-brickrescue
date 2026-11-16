@@ -11,6 +11,7 @@ export interface BrickPart {
   rarity_score: number;
   imageUrl: string;
   brickognizeUrl?: string;
+  photoBox?: number;
   // For checklist parts marked "Found": the actual scanned key (base_color, lowercased)
   // that matched this part. May differ from this part's own key when the color-independent
   // fallback matched it (REQ-RAD-006a) — un-marking must remove THIS scanned entry, not the
