@@ -25,8 +25,8 @@ Open [localhost:5174](http://localhost:5174/). Run the catalog command on a fres
 
 ## How the scan works
 
-- **Find pieces.** The browser uses brightness and saturation to pick out foreground pixels, groups connected pixels, and crops the resulting regions. Touching pieces can land in the same box, and pale pieces can blend into the background.
-- **Identify parts and estimate colors.** Brickognize returns candidates for each crop. The app uses the first candidate and estimates color in the browser by comparing sampled pixels with catalog colors.
+- **Find pieces.** The browser compares each pixel with the table around it, so it works on light or dark surfaces and under uneven light, and ignores soft shadows. It then groups connected pixels and crops each region. Uploaded photos and live camera captures both go through this step. Touching pieces can still land in the same box.
+- **Identify parts and estimate colors.** Brickognize returns candidates for each crop. The app uses the first candidate and estimates color in the browser. It matches each piece's own pixels to solid catalog colors, after correcting for tinted light when the table is neutral.
 - **Rank sets.** The browser compares identified part numbers and the photo’s color profile with the local Rebrickable catalog. Rarer matched parts carry more weight. Quantity edits update the scanned list.
 
 Run `npm run check` for Svelte and TypeScript checks and `npm test` for unit tests.

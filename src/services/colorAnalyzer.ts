@@ -1,5 +1,6 @@
 import type { ScannedColorInput } from "./types";
 import type { CatalogColor } from "./catalog.svelte";
+import type { Rgb } from "./photoParts";
 
 // Analysis tuning (see CameraFeed.svelte: 64x80 offscreen canvas, 1.5s interval)
 const SAMPLE_STRIDE = 40; // sample every 10th pixel (4 channels * 10)
@@ -23,9 +24,14 @@ function hexToRgb(hex: string): { r: number; g: number; b: number } | null {
   };
 }
 
+// Transparent, metallic, legacy-line and placeholder colors either can't be told apart by a camera
+// or duplicate a modern solid color, and they soaked up shadow and glare pixels.
+const NON_SOLID_COLOR = /^(trans|chrome|metallic|pearl|glitter|opal|speckle|glow|two-tone|modulex|ho |duplo|fabuland|vintage|clikits|\[)|^(metal|copper|flat silver|flat dark gold)$/i;
+
 export function buildRgbLookup(colors: Record<number, CatalogColor>): RgbLookupEntry[] {
   const lookup: RgbLookupEntry[] = [];
   for (const idStr in colors) {
+    if (NON_SOLID_COLOR.test(colors[idStr].name)) continue;
     const rgb = hexToRgb(colors[idStr].hex);
     if (rgb) lookup.push({ id: Number(idStr), ...rgb });
   }
@@ -33,20 +39,27 @@ export function buildRgbLookup(colors: Record<number, CatalogColor>): RgbLookupE
 }
 
 // Map sampled pixels to their nearest catalog color and return the normalized
-// weights of the dominant colors (descending).
+// weights of the dominant colors (descending). With a background color, pixels are
+// white-balanced first so the background reads as neutral gray (removes warm/cool light casts).
 export function analyzeDominantColors(
   data: Uint8ClampedArray,
-  lookup: RgbLookupEntry[]
+  lookup: RgbLookupEntry[],
+  background?: Rgb
 ): ScannedColorInput[] {
   if (lookup.length === 0) return [];
+  // Only a near-neutral background (paper, gray mat) is a trustworthy white reference;
+  // balancing against orange wood would turn brown bricks gray.
+  const neutral = background && Math.max(...background) - Math.min(...background) <= 0.3 * Math.max(...background);
+  const mean = neutral ? (background[0] + background[1] + background[2]) / 3 : 1;
+  const gains = neutral ? background.map((c) => mean / Math.max(1, c)) : [1, 1, 1];
 
   const colorCounts: Record<number, number> = {};
   let totalCount = 0;
 
   for (let i = 0; i < data.length; i += SAMPLE_STRIDE) {
-    const r = data[i];
-    const g = data[i + 1];
-    const b = data[i + 2];
+    const r = Math.min(255, data[i] * gains[0]);
+    const g = Math.min(255, data[i + 1] * gains[1]);
+    const b = Math.min(255, data[i + 2] * gains[2]);
 
     let nearestColorId = -1;
     let minDistance = Infinity;
@@ -56,7 +69,9 @@ export function analyzeDominantColors(
       const dr = r - entry.r;
       const dg = g - entry.g;
       const db = b - entry.b;
-      const dist = dr * dr + dg * dg + db * db;
+      // "Redmean" weighting tracks perceived difference far better than plain RGB distance.
+      const redMean = (r + entry.r) / 2;
+      const dist = (512 + redMean) * dr * dr + 1024 * dg * dg + (767 - redMean) * db * db;
       if (dist < minDistance) {
         minDistance = dist;
         nearestColorId = entry.id;

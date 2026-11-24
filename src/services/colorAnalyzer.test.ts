@@ -57,4 +57,17 @@ describe("BrickRelic - Color Analyzer", () => {
     expect(sameDominantColors(a, [{ color_id: 4, weight: 0.7 }, { color_id: 15, weight: 0.3 }])).toBe(false);
     expect(sameDominantColors(a, [{ color_id: 0, weight: 0.7 }])).toBe(false);
   });
+
+  it("skips transparent and legacy colors and corrects a warm light cast", () => {
+    const lookup = buildRgbLookup({
+      70: { name: "Reddish Brown", hex: "#582A12" },
+      28: { name: "Dark Tan", hex: "#958A73" },
+      35: { name: "Trans-Brown", hex: "#635F52" },
+      1000: { name: "Modulex Brown", hex: "#907450" }
+    });
+    expect(lookup.map((entry) => entry.id)).toEqual([28, 70]);
+    // Gray brick photographed under warm light on a warm-tinted table
+    const result = analyzeDominantColors(makePixels([[175, 140, 100]]), lookup, [250, 225, 190]);
+    expect(result[0].color_id).toBe(28);
+  });
 });

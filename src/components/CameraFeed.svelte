@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onDestroy } from "svelte";
   import type { BrickPart, ScannedColorInput } from "../services/types";
-  import { findPhotoParts } from "../services/photoParts";
+  import { backgroundColor, findPhotoParts, foregroundMask } from "../services/photoParts";
   import { predictPartFromImage } from "../services/api";
   import { loadColors, resolveColor } from "../services/catalog.svelte";
   import { buildRgbLookup, analyzeDominantColors, sameDominantColors, type RgbLookupEntry } from "../services/colorAnalyzer";
@@ -136,6 +136,16 @@
     };
   });
 
+  // Pixels of the pieces only, so the table color doesn't dominate; falls back to the whole frame.
+  function foregroundPixels(image: ImageData) {
+    const mask = foregroundMask(image);
+    const pixels = new Uint8ClampedArray(mask.reduce((sum, on) => sum + on, 0) * 4);
+    for (let i = 0, offset = 0; i < mask.length; i++) {
+      if (mask[i]) pixels.set(image.data.subarray(i * 4, i * 4 + 4), (offset++) * 4);
+    }
+    return pixels.length ? pixels : image.data;
+  }
+
   // Reset colors if camera is stopped
   $effect(() => {
     if (!streamActive && isCameraRequested) {
@@ -156,8 +166,9 @@
         // Draw video frame to small offscreen canvas to analyze pixels
         ctx.drawImage(videoElement, 0, 0, canvas.width, canvas.height);
         const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const background = backgroundColor(imgData);
 
-        const detectedColors = analyzeDominantColors(imgData.data, colorRgbLookup);
+        const detectedColors = analyzeDominantColors(foregroundPixels(imgData), colorRgbLookup, background);
 
         // Only publish a change when the dominant colors actually moved —
         // otherwise every 1.5s tick would trigger a full matching run.
@@ -234,78 +245,9 @@
       photoBoxes = [];
       unidentified = [];
 
-      const detection = document.createElement("canvas");
-      const scale = Math.min(1, 800 / Math.max(canvas.width, canvas.height));
-      detection.width = Math.max(1, Math.round(canvas.width * scale));
-      detection.height = Math.max(1, Math.round(canvas.height * scale));
-      const detector = detection.getContext("2d", { willReadFrequently: true });
-      if (!detector) throw new Error("Could not get 2D context for detecting pieces");
-      detector.drawImage(canvas, 0, 0, detection.width, detection.height);
-      const parts = findPhotoParts(detector.getImageData(0, 0, detection.width, detection.height));
-      photoBoxes = parts.map((part) => ({
-        left: part.left / detection.width * 100,
-        top: part.top / detection.height * 100,
-        width: (part.right - part.left + 1) / detection.width * 100,
-        height: (part.bottom - part.top + 1) / detection.height * 100
-      }));
-      const lookup = buildRgbLookup(await loadColors());
       isCameraRequested = false;
       cameraError = null;
-
-      if (parts.length > 0) {
-        const pixels = new Uint8ClampedArray(parts.reduce((size, part) => size + part.pixels.length, 0));
-        let offset = 0;
-        for (const part of parts) {
-          pixels.set(part.pixels, offset);
-          offset += part.pixels.length;
-        }
-        scannedColors = analyzeDominantColors(pixels, lookup);
-        const crop = document.createElement("canvas");
-        const cropCtx = crop.getContext("2d");
-        if (!cropCtx) throw new Error("Could not get 2D context for cropping pieces");
-        const xScale = canvas.width / detection.width;
-        const yScale = canvas.height / detection.height;
-        let recognized = 0;
-        let failed = 0;
-        for (const [index, part] of parts.entries()) {
-          if (destroyed) return;
-          activePhotoBox = index;
-          photoProgress = `Scanning piece ${index + 1} of ${parts.length}…`;
-          const left = Math.max(0, Math.floor((part.left - 5) * xScale));
-          const top = Math.max(0, Math.floor((part.top - 5) * yScale));
-          crop.width = Math.min(canvas.width, Math.ceil((part.right + 6) * xScale)) - left;
-          crop.height = Math.min(canvas.height, Math.ceil((part.bottom + 6) * yScale)) - top;
-          cropCtx.drawImage(canvas, left, top, crop.width, crop.height, 0, 0, crop.width, crop.height);
-          const colorId = analyzeDominantColors(part.pixels, lookup)[0]?.color_id ?? DEFAULT_COLOR_ID;
-          try {
-            if (await recognize(crop, colorId, true, index + 1)) {
-              recognized++;
-            } else if (!destroyed) {
-              unidentified.push({ box: index + 1, imageUrl: crop.toDataURL("image/jpeg", 0.7), requestFailed: false });
-            }
-          } catch (err) {
-            console.error("Error identifying photo crop:", err);
-            failed++;
-            if (!destroyed) {
-              unidentified.push({ box: index + 1, imageUrl: crop.toDataURL("image/jpeg", 0.7), requestFailed: true });
-            }
-          }
-        }
-        photoProgress = `Recognized ${recognized} of ${parts.length} detected pieces.` +
-          (unidentified.length ? ` ${unidentified.length} unidentified.` : "") +
-          (failed ? ` ${failed} requests failed.` : "");
-        return;
-      }
-
-      const sample = canvasElement;
-      const sampleCtx = sample?.getContext("2d");
-      if (!sample || !sampleCtx) throw new Error("Could not get 2D context from sample canvas");
-      sampleCtx.drawImage(canvas, 0, 0, sample.width, sample.height);
-      scannedColors = analyzeDominantColors(
-        sampleCtx.getImageData(0, 0, sample.width, sample.height).data,
-        lookup
-      );
-      await classifyCapture(canvas, true);
+      await scanPieces(canvas, true);
     } catch (err) {
       console.error("Error preparing scan photo:", err);
       showScanFeedback("Could not read that photo. Try a JPEG or PNG.");
@@ -313,6 +255,82 @@
       activePhotoBox = -1;
       isFrozen = false;
     }
+  }
+
+  // Finds the pieces in `canvas` and sends each crop to Brickognize. Photos also get numbered boxes
+  // and an unidentified list; camera captures report a summary in the viewfinder instead.
+  async function scanPieces(canvas: HTMLCanvasElement, fromPhoto: boolean) {
+    const detection = document.createElement("canvas");
+    const scale = Math.min(1, 800 / Math.max(canvas.width, canvas.height));
+    detection.width = Math.max(1, Math.round(canvas.width * scale));
+    detection.height = Math.max(1, Math.round(canvas.height * scale));
+    const detector = detection.getContext("2d", { willReadFrequently: true });
+    if (!detector) throw new Error("Could not get 2D context for detecting pieces");
+    detector.drawImage(canvas, 0, 0, detection.width, detection.height);
+    const image = detector.getImageData(0, 0, detection.width, detection.height);
+    const background = backgroundColor(image);
+    const parts = findPhotoParts(image);
+    if (fromPhoto) {
+      photoBoxes = parts.map((part) => ({
+        left: part.left / detection.width * 100,
+        top: part.top / detection.height * 100,
+        width: (part.right - part.left + 1) / detection.width * 100,
+        height: (part.bottom - part.top + 1) / detection.height * 100
+      }));
+    }
+    const lookup = buildRgbLookup(await loadColors());
+
+    if (parts.length === 0) {
+      scannedColors = analyzeDominantColors(foregroundPixels(image), lookup, background);
+      await classifyCapture(canvas, fromPhoto);
+      return;
+    }
+
+    const pixels = new Uint8ClampedArray(parts.reduce((size, part) => size + part.pixels.length, 0));
+    let offset = 0;
+    for (const part of parts) {
+      pixels.set(part.pixels, offset);
+      offset += part.pixels.length;
+    }
+    scannedColors = analyzeDominantColors(pixels, lookup, background);
+    const crop = document.createElement("canvas");
+    const cropCtx = crop.getContext("2d");
+    if (!cropCtx) throw new Error("Could not get 2D context for cropping pieces");
+    const xScale = canvas.width / detection.width;
+    const yScale = canvas.height / detection.height;
+    let recognized = 0;
+    let missed = 0;
+    let failed = 0;
+    for (const [index, part] of parts.entries()) {
+      if (destroyed) return;
+      if (fromPhoto) activePhotoBox = index;
+      photoProgress = `Scanning piece ${index + 1} of ${parts.length}…`;
+      const left = Math.max(0, Math.floor((part.left - 5) * xScale));
+      const top = Math.max(0, Math.floor((part.top - 5) * yScale));
+      crop.width = Math.min(canvas.width, Math.ceil((part.right + 6) * xScale)) - left;
+      crop.height = Math.min(canvas.height, Math.ceil((part.bottom + 6) * yScale)) - top;
+      cropCtx.drawImage(canvas, left, top, crop.width, crop.height, 0, 0, crop.width, crop.height);
+      const colorId = analyzeDominantColors(part.pixels, lookup, part.background)[0]?.color_id ?? DEFAULT_COLOR_ID;
+      try {
+        if (await recognize(crop, colorId, true, fromPhoto ? index + 1 : undefined)) {
+          recognized++;
+        } else if (!destroyed) {
+          missed++;
+          if (fromPhoto) unidentified.push({ box: index + 1, imageUrl: crop.toDataURL("image/jpeg", 0.7), requestFailed: false });
+        }
+      } catch (err) {
+        console.error("Error identifying photo crop:", err);
+        failed++;
+        if (!destroyed && fromPhoto) {
+          unidentified.push({ box: index + 1, imageUrl: crop.toDataURL("image/jpeg", 0.7), requestFailed: true });
+        }
+      }
+    }
+    const summary = `Recognized ${recognized} of ${parts.length} detected pieces.` +
+      (missed + failed ? ` ${missed + failed} unidentified.` : "") +
+      (failed ? ` ${failed} requests failed.` : "");
+    photoProgress = fromPhoto ? summary : "";
+    if (!fromPhoto) showScanFeedback(summary);
   }
 
   // Core capture and classification logic
@@ -345,11 +363,14 @@
 
         ctx.drawImage(videoElement, 0, 0, canvas.width, canvas.height);
 
-        await classifyCapture(canvas);
+        await scanPieces(canvas, false);
       } catch (err) {
         console.error("Error during image capture:", err);
+        showScanFeedback("Scan failed. Check your connection and try again.");
+      } finally {
         isFrozen = false;
         tapPosition = null;
+        photoProgress = "";
       }
     } else {
       isFrozen = false;
@@ -474,7 +495,7 @@
         <div class="hud-bottom">
           <div class="hud-hint">
             {#if isFrozen}
-              Processing image...
+              {photoProgress || "Processing image..."}
             {:else if scanFeedback}
               {scanFeedback}
             {:else}
