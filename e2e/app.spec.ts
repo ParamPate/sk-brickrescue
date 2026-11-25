@@ -1,7 +1,10 @@
 import { test, expect, type Page } from "@playwright/test";
 
 // Full user flow against the real generated catalog with a fake camera device.
-// Only the Brickognize API is mocked — everything else runs like production.
+// Only Brickognize (its public endpoint and the same-origin /api/brickognize
+// proxy) is mocked — everything else runs like production.
+
+const BRICKOGNIZE = /api\.brickognize\.com|\/api\/brickognize/;
 
 const SCANNED_PART = {
   id: "3001",
@@ -11,7 +14,7 @@ const SCANNED_PART = {
 };
 
 async function mockBrickognize(page: Page, items: unknown[] = [SCANNED_PART]) {
-  await page.route("https://api.brickognize.com/**", (route) =>
+  await page.route(BRICKOGNIZE, (route) =>
     route.fulfill({ json: { items } })
   );
 }
@@ -27,7 +30,7 @@ async function enterScanner(page: Page) {
 test("opens the branded scanner directly with the camera off", async ({ page }) => {
   await page.goto("/");
   await expect(page.getByRole("heading", { name: "SK Brickhouse" })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Scan Photo" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Scan Photos" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Start Camera" })).toBeVisible();
   await expect(page.locator("video.camera-video")).toBeHidden();
 });
@@ -56,7 +59,7 @@ test("failed recognition surfaces distinguishable HUD feedback (REQ-SYS-005)", a
   await expect(page.locator(".found-item-card")).toHaveCount(0);
 });
 
-test("excavation mode: unearth boosts progress, found badge un-marks, set stays open (REQ-RAD-006/007)", async ({ page }) => {
+test("excavation mode: counting pieces raises progress, un-counting lowers it, set stays open (REQ-RAD-006/007)", async ({ page }) => {
   await mockBrickognize(page);
   await enterScanner(page);
 
@@ -64,33 +67,36 @@ test("excavation mode: unearth boosts progress, found badge un-marks, set stays 
   await expect(page.locator(".radar-set-card").first()).toBeVisible({ timeout: 20_000 });
   await page.locator(".radar-set-card").first().click();
 
-  // Dig panel with hero, progress gauge and found-first checklist
+  // Dig panel with hero, progress gauge and the set's full inventory
   await expect(page.locator(".dig-panel")).toBeVisible();
-  await expect(page.locator(".dig-progress-header")).toContainText("Key artifacts unearthed");
-  const markFoundButtons = page.locator(".btn-action", { hasText: "Found" });
-  await expect(markFoundButtons.first()).toBeVisible({ timeout: 15_000 });
+  await expect(page.locator(".dig-progress-header")).toContainText("Pieces found:");
+  const firstLine = page.locator(".check-item-card").first();
+  await expect(firstLine).toBeVisible({ timeout: 15_000 });
+  const lineName = await firstLine.locator(".check-item-meta span").nth(1).innerText();
+  const line = page.locator(".check-item-card", { hasText: lineName }).first();
 
-  // Mark one part as found → it flips to the green Found state; the set stays open
-  // even though the re-match may change the top 3 (FIND-033 regression)
-  await markFoundButtons.first().click();
-  await expect(page.locator(".badge-found").first()).toBeVisible({ timeout: 10_000 });
+  // Count one piece as found; the set stays open even though the re-match may
+  // change the top 3 (FIND-033 regression)
+  await line.getByRole("button", { name: "Found one more" }).click();
+  await expect(line.locator(".check-item-count")).toContainText(/^\s*−?\s*1\//, { timeout: 10_000 });
   await expect(page.locator(".dig-panel")).toBeVisible();
 
-  // Found is a toggle: un-marking returns the part to the missing state
-  const foundCount = await page.locator(".badge-found").count();
-  await page.locator(".badge-found").first().click();
-  await expect(page.locator(".badge-found")).toHaveCount(foundCount - 1, { timeout: 10_000 });
+  // Un-counting returns the line to zero found
+  await line.getByRole("button", { name: "One fewer found" }).click();
+  await expect(line.locator(".check-item-count")).toContainText(/^\s*−?\s*0\//, { timeout: 10_000 });
   await expect(page.locator(".dig-panel")).toBeVisible();
 });
 
-test("Reset scan clears search progress", async ({ page }) => {
+test("New batch clears search progress", async ({ page }) => {
   await mockBrickognize(page);
   await enterScanner(page);
 
   await page.locator(".scanner-viewport").click({ position: { x: 150, y: 150 } });
   await expect(page.locator(".found-item-card")).toHaveCount(1, { timeout: 10_000 });
 
-  await page.getByRole("button", { name: "Reset scan" }).click();
+  await page.getByRole("button", { name: "New batch" }).click();
+  await page.getByRole("button", { name: "Discard and start new" }).click();
+  await page.getByRole("button", { name: "Discard batch" }).click();
   await expect(page.getByRole("button", { name: "Start Camera" })).toBeVisible();
   await expect(page.locator(".found-item-card")).toHaveCount(0);
   await expect(page.locator(".found-items-empty")).toBeVisible();
@@ -99,7 +105,7 @@ test("Reset scan clears search progress", async ({ page }) => {
 test("scanned bricks with long names never overflow the page horizontally (FIND-047)", async ({ page }) => {
   // Return a DIFFERENT part on each call so scans don't dedupe — fills the shelf past its width.
   let n = 0;
-  await page.route("https://api.brickognize.com/**", (route) => {
+  await page.route(BRICKOGNIZE, (route) => {
     n += 1;
     route.fulfill({
       json: {
@@ -144,13 +150,13 @@ test("photo scanning works with camera access denied", async ({ page }) => {
     ctx.fillRect(0, 0, 100, 100);
     return canvas.toDataURL("image/png").split(",")[1];
   });
-  const input = page.locator('input[type="file"]');
+  const input = page.locator('.photo-scan input[type="file"]:not([webkitdirectory])');
   await input.setInputFiles({
     name: "invalid.png",
     mimeType: "image/png",
     buffer: Buffer.from("invalid image")
   });
-  await expect(page.getByRole("status")).toContainText("Could not read that photo");
+  await expect(page.locator(".photo-scan [role=status]")).toContainText("could not be read");
   await input.setInputFiles({
     name: "brick.png",
     mimeType: "image/png",
@@ -160,4 +166,31 @@ test("photo scanning works with camera access denied", async ({ page }) => {
   await expect(page.locator(".found-item-name")).toHaveText("Brick 2 x 4");
   await expect(page.locator(".color-bar")).toHaveCount(1);
   await expect(page.locator(".radar-set-card").first()).toBeVisible();
+});
+
+test("verify a set: search, load the part list and filter the live report", async ({ page }) => {
+  // Mock Rebrickable so the test never uses the real API quota; without an API
+  // key the app reads the same set from the local catalog instead.
+  await page.route("https://rebrickable.com/api/v3/lego/sets/40611-1/", (route) =>
+    route.fulfill({ json: { set_num: "40611-1", name: "Year of the Dragon", year: 2024, num_parts: 3, set_img_url: "" } }));
+  await page.route("https://rebrickable.com/api/v3/lego/sets/40611-1/parts/**", (route) =>
+    route.fulfill({ json: { next: null, results: [{
+      part: { part_num: "15573", name: "Plate Special 1 x 2 Jumper", part_img_url: null, external_ids: { BrickLink: ["15573"] } },
+      color: { id: 0, name: "Black", rgb: "05131D", external_ids: { BrickLink: { ext_ids: [11] } } },
+      quantity: 3, is_spare: false
+    }] } }));
+  await page.goto("/");
+  await page.getByRole("tab", { name: "Verify set" }).click();
+  const search = page.getByRole("combobox", { name: "Set number or name" });
+  await search.fill("40611");
+  await search.press("Enter");
+  await expect(page.locator(".verify-summary")).toContainText("Year of the Dragon", { timeout: 20_000 });
+  await expect(page.getByRole("tab", { name: /Missing/ })).toHaveAttribute("aria-selected", "true");
+  await expect(page.locator(".verify-row").first()).toBeVisible();
+
+  // Counting a piece by hand updates the report immediately
+  const firstRow = page.locator(".verify-row").first();
+  const before = await page.locator(".verify-tab.tab-missing strong").innerText();
+  await firstRow.getByRole("button", { name: "One more" }).click();
+  await expect(page.locator(".verify-tab.tab-missing strong")).not.toHaveText(before);
 });

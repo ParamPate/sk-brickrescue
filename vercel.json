@@ -1,4 +1,14 @@
 {
+  "rewrites": [
+    {
+      "source": "/api/brickognize",
+      "destination": "https://api.brickognize.com/internal/search/?external_catalogs=bricklink&predict_color=true"
+    },
+    {
+      "source": "/api/bricklink-colors",
+      "destination": "https://www.bricklink.com/catalogColors.asp"
+    }
+  ],
   "headers": [
     {
       "source": "/(.*)",
@@ -7,15 +17,36 @@
           "key": "Content-Security-Policy",
           "value": "default-src 'self'; img-src 'self' data: blob: https:; connect-src 'self' https://api.brickognize.com; style-src 'self' 'unsafe-inline'; font-src 'self'; media-src 'self' blob: mediastream:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
         },
-        { "key": "X-Content-Type-Options", "value": "nosniff" },
-        { "key": "Referrer-Policy", "value": "strict-origin-when-cross-origin" },
-        { "key": "Permissions-Policy", "value": "camera=(self), microphone=(), geolocation=()" }
+        {
+          "key": "X-Content-Type-Options",
+          "value": "nosniff"
+        },
+        {
+          "key": "Referrer-Policy",
+          "value": "strict-origin-when-cross-origin"
+        },
+        {
+          "key": "Permissions-Policy",
+          "value": "camera=(self), microphone=(), geolocation=()"
+        }
       ]
     },
     {
       "source": "/catalog/(.*)",
       "headers": [
-        { "key": "Cache-Control", "value": "public, max-age=3600, stale-while-revalidate=86400" }
+        {
+          "key": "Cache-Control",
+          "value": "public, max-age=3600, stale-while-revalidate=86400"
+        }
+      ]
+    },
+    {
+      "source": "/data/(.*)",
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "public, max-age=3600, stale-while-revalidate=86400"
+        }
       ]
     }
   ]

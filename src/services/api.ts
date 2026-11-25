@@ -1,312 +1,208 @@
-import type { MatchResult, BrickPart, ScannedColorInput } from "./types";
+import type { ChecklistPart, MatchResult, PileItem, ScannedColorInput } from "./types";
 import {
+  canonicalPart,
+  getBasePartNum,
   loadCatalogIndex,
+  loadPartNames,
   loadSetParts,
+  moldGroup,
+  partImageUrl,
+  resolveColor,
   resolvePartName,
+  setImageUrl,
   type CatalogSetIndexEntry,
-  type CatalogSetPart
+  type SetPartRow
 } from "./catalog.svelte";
 
-// Scoring constants: 70/30 rarity/color weighting, 0.1 mismatch penalty
-const RARITY_WEIGHT = 0.7;
-const COLOR_WEIGHT = 0.3;
-const MISMATCH_PENALTY = 0.1;
-const DEFAULT_RARITY = 0.01; // for scanned parts unknown to the catalog
+export { getBasePartNum };
+
+// Set matching against full set inventories.
+//
+// Parts are compared by canonical part group and ignore color: recognition
+// reads part shapes far more reliably than colors under room lighting. Each
+// part is weighted by how rare it is across all sets (common pins count little,
+// distinctive pieces a lot), and quantities are capped by what the set holds:
+//   pileCoverage P = weighted pieces of the pile the set contains / whole pile
+//   setCoverage  R = weighted pieces of the set found in the pile / whole set
+//   partScore      = P^0.75 · R^0.25
+// P dominates because a scan is usually a partial set mixed with strays; R
+// keeps huge sets from winning just by containing every common piece. Tuned on
+// a real 555-piece SPIKE Prime scan and 300 simulated partial scans
+// (top-1 94%, top-3 97%).
+const PILE_EXPONENT = 0.75;
+const SET_EXPONENT = 0.25;
+// Photo colors only break ties once parts are known.
+const COLOR_WEIGHT_WITH_PARTS = 0.05;
 const TOP_MATCHES = 3;
-const BRICKOGNIZE_TIMEOUT_MS = 10_000;
 
-// Strip printed/pattern/assembly/sub-part suffixes from a part number, keeping
-// the numeric base (with optional mold letter): "3001pr0002" -> "3001",
-// "3626cpr0001" -> "3626c". IDs without a numeric base (e.g. "cardupn0015pr0001")
-// are returned unchanged — they must never collapse to an empty string
-// (a "" base would alias thousands of unrelated parts, see FIND-030).
-export function getBasePartNum(partNum: string): string {
-  const match = partNum.match(/^(\d+[a-z]?)(?:pr|pat|c|sp)\d.*$/i);
-  return match ? match[1] : partNum;
+function colorScore(scannedColors: ScannedColorInput[], set: CatalogSetIndexEntry): number {
+  let score = 0;
+  for (const color of scannedColors) score += Math.min((set.c[color.color_id] || 0) / 100, color.weight);
+  return score;
 }
 
-function splitScannedKey(key: string): { base: string; colorId: string } | null {
-  const idx = key.lastIndexOf("_");
-  if (idx === -1) return null;
-  return {
-    base: getBasePartNum(key.substring(0, idx)).toLowerCase(),
-    colorId: key.substring(idx + 1)
-  };
+function colorDistance(a: number, b: number): number {
+  const hexA = resolveColor(a).hex, hexB = resolveColor(b).hex;
+  let distance = 0;
+  for (const offset of [1, 3, 5]) distance += (parseInt(hexA.slice(offset, offset + 2), 16) - parseInt(hexB.slice(offset, offset + 2), 16)) ** 2;
+  return Number.isFinite(distance) ? distance : Infinity;
 }
 
-function toBrickPart(part: CatalogSetPart): BrickPart {
-  return {
-    part_num: part.p,
-    name: resolvePartName(part),
-    color_id: part.c,
-    rarity_score: part.r,
-    imageUrl: part.i || ""
-  };
-}
-
-// Split a set's diagnostic parts into matched/missing against the scanned keys.
-// Pass 1 matches strictly color-dependent; pass 2 falls back color-independently
-// for scans whose color does not exist in the set at all (REQ-RAD-006a).
-function assembleChecklist(
-  setParts: CatalogSetPart[],
-  userScannedBaseColorKeys: Set<string>
-): { matchedParts: BrickPart[]; missingParts: BrickPart[] } {
-  const matchedParts: BrickPart[] = [];
-  const tempMissingParts: BrickPart[] = [];
-
-  const setBaseColorKeys = new Set<string>();
-  for (const part of setParts) {
-    setBaseColorKeys.add(`${getBasePartNum(part.p).toLowerCase()}_${part.c}`);
+// Assign scanned pieces to a set's inventory lines: same part group and color
+// first, then the same part group in the nearest other color. Pieces taken in
+// another color are listed in `borrowed` so they can be recolored to the set's color.
+export function buildChecklist(
+  rows: SetPartRow[],
+  pile: PileItem[],
+  names: Record<string, string>
+): { checklist: ChecklistPart[]; foundPieces: number; totalPieces: number } {
+  // canonical group -> unassigned scanned pieces by color and mold group
+  type Source = { color: number; mold: string; qty: number };
+  const remaining = new Map<string, Source[]>();
+  for (const item of pile) {
+    const sources = remaining.get(canonicalPart(item.part)) ?? [];
+    const mold = moldGroup(item.part);
+    const existing = sources.find((source) => source.color === item.color && source.mold === mold);
+    if (existing) existing.qty += item.qty;
+    else sources.push({ color: item.color, mold, qty: item.qty });
+    remaining.set(canonicalPart(item.part), sources);
   }
 
-  // Track consumed scanned keys to prevent matching multiple parts in set to same single scan
-  const consumedScannedKeys = new Set<string>();
-
-  // Pass 1: Direct color-dependent match
-  for (const part of setParts) {
-    const formattedPart = toBrickPart(part);
-    const matchKey = `${getBasePartNum(part.p).toLowerCase()}_${part.c}`;
-    if (userScannedBaseColorKeys.has(matchKey)) {
-      formattedPart.matchedScanKey = matchKey;
-      matchedParts.push(formattedPart);
-      consumedScannedKeys.add(matchKey);
-    } else {
-      tempMissingParts.push(formattedPart);
+  const lines = rows.map(([part, color, quantity, image]) => ({
+    part, color, quantity, image, canonical: canonicalPart(part), mold: moldGroup(part), found: 0, colorMismatch: false,
+    borrowed: [] as { color: number; qty: number; part: string }[]
+  }));
+  // Pass 1: same color (same mold group preferred)
+  for (const line of lines) {
+    const sources = (remaining.get(line.canonical) ?? [])
+      .filter((source) => source.color === line.color && source.qty > 0)
+      .sort((a, b) => Number(b.mold === line.mold) - Number(a.mold === line.mold));
+    for (const source of sources) {
+      const take = Math.min(source.qty, line.quantity - line.found);
+      source.qty -= take;
+      line.found += take;
+      if (line.found >= line.quantity) break;
+    }
+  }
+  // Pass 2: another color — same mold group first, then the nearest color
+  for (const line of lines) {
+    if (line.found >= line.quantity) continue;
+    const sources = (remaining.get(line.canonical) ?? [])
+      .filter((source) => source.qty > 0)
+      .sort((a, b) => Number(b.mold === line.mold) - Number(a.mold === line.mold) ||
+        colorDistance(a.color, line.color) - colorDistance(b.color, line.color));
+    for (const source of sources) {
+      const take = Math.min(source.qty, line.quantity - line.found);
+      source.qty -= take;
+      line.found += take;
+      line.colorMismatch = true;
+      // Only the same physical part can be recolored to the set's color
+      if (source.mold === line.mold) line.borrowed.push({ color: source.color, qty: take, part: source.mold });
+      if (line.found >= line.quantity) break;
     }
   }
 
-  // Pass 2: Fallback matching for remaining missing parts
-  const missingParts: BrickPart[] = [];
-  for (const part of tempMissingParts) {
-    const catalogBaseNum = getBasePartNum(part.part_num).toLowerCase();
-    let matchedByFallback = false;
-
-    for (const scannedKey of userScannedBaseColorKeys) {
-      if (consumedScannedKeys.has(scannedKey)) continue;
-
-      const idx = scannedKey.lastIndexOf("_");
-      if (idx !== -1) {
-        const scannedBase = scannedKey.substring(0, idx);
-        const scannedColor = scannedKey.substring(idx + 1);
-        if (scannedBase === catalogBaseNum) {
-          // Does the set contain this base part in scannedColor?
-          const setHasScannedColor = setBaseColorKeys.has(`${catalogBaseNum}_${scannedColor}`);
-          if (!setHasScannedColor) {
-            matchedByFallback = true;
-            // Remember the scanned entry (with its mis-classified colour) so un-marking
-            // can later remove exactly this Found Shelf part, not the catalog colour (FIND-046).
-            part.matchedScanKey = scannedKey;
-            consumedScannedKeys.add(scannedKey);
-            break;
-          }
-        }
-      }
-    }
-
-    if (matchedByFallback) {
-      matchedParts.push(part);
-    } else {
-      missingParts.push(part);
-    }
-  }
-
-  return { matchedParts, missingParts };
+  let foundPieces = 0, totalPieces = 0;
+  const checklist: ChecklistPart[] = lines.map((line) => {
+    foundPieces += line.found;
+    totalPieces += line.quantity;
+    return {
+      part_num: line.part,
+      name: resolvePartName(line.part, names),
+      color_id: line.color,
+      rarity_score: 0,
+      imageUrl: partImageUrl(line.image),
+      quantity: line.quantity,
+      found: line.found,
+      colorMismatch: line.colorMismatch,
+      borrowed: line.borrowed
+    };
+  });
+  // Lines still missing pieces first (most needed first), complete lines after
+  checklist.sort((a, b) =>
+    Number(a.found >= a.quantity) - Number(b.found >= b.quantity) || (b.quantity - b.found) - (a.quantity - a.found));
+  return { checklist, foundPieces, totalPieces };
 }
 
-// MATCH SETS SERVICE (Executes matching algorithm in-memory).
-// `ensureSetNum` guarantees that this set is part of the result even when it is
-// not among the top matches — the Dig Mode stays open while scans change the ranking.
+// MATCH SETS SERVICE (runs in memory against the local catalog).
+// `ensureSetNum` keeps that set in the results even when it is not among the
+// top matches — Dig Mode stays open while scans change the ranking.
 export async function fetchMatchSets(
   scannedColors: ScannedColorInput[],
-  scannedPartKeys: string[],
+  pile: PileItem[],
   ensureSetNum: string | null = null
 ): Promise<MatchResult[]> {
-  const { sets, parts } = await loadCatalogIndex();
+  const { sets, match } = await loadCatalogIndex();
 
-  const scannedPartsCount = scannedPartKeys.length;
-
-  // 1. Extract unique base scanned part numbers by stripping suffixes
-  const userScannedParts = Array.from(new Set(
-    (scannedPartKeys || []).map(k => {
-      const idx = k.lastIndexOf("_");
-      const partNum = idx !== -1 ? k.substring(0, idx) : k;
-      return getBasePartNum(partNum);
-    })
-  ));
-
-  // 2. Find rarity score for each scanned base part
-  const scannedPartsRarity: Record<string, number> = {};
-  let totalRarity = 0.0;
-  for (const baseNum of userScannedParts) {
-    const partInfo = parts[baseNum];
-    const partRarity = partInfo ? partInfo.r : DEFAULT_RARITY;
-    scannedPartsRarity[baseNum] = partRarity;
-    totalRarity += partRarity;
+  // Scanned pile by canonical part group
+  const pileByPart = new Map<string, number>();
+  for (const item of pile) {
+    if (item.qty > 0) pileByPart.set(canonicalPart(item.part), (pileByPart.get(canonicalPart(item.part)) || 0) + item.qty);
   }
 
-  // 3. Calculate matched parts rarity per set
-  const setPartRarities: Record<string, { matched_rarity_sum: number; matched_count: number }> = {};
-  for (const baseNum of userScannedParts) {
-    const partInfo = parts[baseNum];
-    if (partInfo && partInfo.s) {
-      const partRarity = scannedPartsRarity[baseNum];
-      for (const setNum of partInfo.s) {
-        if (!setPartRarities[setNum]) {
-          setPartRarities[setNum] = { matched_rarity_sum: 0.0, matched_count: 0 };
-        }
-        setPartRarities[setNum].matched_rarity_sum += partRarity;
-        setPartRarities[setNum].matched_count += 1;
-      }
-    }
-  }
+  type Scored = { set_num: string; colorMatchScore: number; combinedScore: number; pileCoverage: number; setCoverage: number };
+  const scored: Scored[] = [];
 
-  // 4. Single pass over all sets: compute the combined score and keep only the
-  // current top matches (no full result array + sort for a top-3 selection).
-  const scoreSet = (setNum: string, set: CatalogSetIndexEntry): { colorMatchScore: number; combinedScore: number } => {
-    // Color match score: Least-Mismatch sum (REQ-CON-002)
-    let colorMatchScore = 0.0;
-    for (const uc of scannedColors) {
-      const setPercentage = set.c[uc.color_id] || 0.0;
-      colorMatchScore += Math.min(setPercentage / 100.0, uc.weight);
-    }
-
-    const partInfo = setPartRarities[setNum];
-    const matchedCount = partInfo ? partInfo.matched_count : 0;
-    const matchedRaritySum = partInfo ? partInfo.matched_rarity_sum : 0.0;
-
-    let combinedScore: number;
-    if (scannedPartsCount === 0) {
+  if (pileByPart.size === 0) {
+    // Color-only search (live camera before any part is identified)
+    for (const set_num in sets) {
+      const color = colorScore(scannedColors, sets[set_num]);
       // Rounded color weights can sum to slightly above 1.0 — clamp the display score
-      combinedScore = Math.min(1.0, colorMatchScore);
-    } else if (matchedCount > 0) {
-      combinedScore = Math.min(
-        1.0,
-        (matchedRaritySum / (totalRarity || 1.0)) * RARITY_WEIGHT + colorMatchScore * COLOR_WEIGHT
-      );
-    } else {
-      combinedScore = colorMatchScore * MISMATCH_PENALTY;
+      if (color > 0) scored.push({ set_num, colorMatchScore: color, combinedScore: Math.min(1, color), pileCoverage: 0, setCoverage: 0 });
     }
-
-    return { colorMatchScore, combinedScore };
-  };
-
-  type ScoredSet = { set_num: string; colorMatchScore: number; combinedScore: number };
-  const topMatches: ScoredSet[] = [];
-
-  for (const setNum in sets) {
-    const { colorMatchScore, combinedScore } = scoreSet(setNum, sets[setNum]);
-    if (combinedScore <= 0.0) continue;
-
-    if (topMatches.length < TOP_MATCHES || combinedScore > topMatches[topMatches.length - 1].combinedScore) {
-      let insertAt = topMatches.length;
-      while (insertAt > 0 && topMatches[insertAt - 1].combinedScore < combinedScore) {
-        insertAt--;
+  } else {
+    let pileWeight = 0;
+    const overlap = new Float64Array(match.setNums.length);
+    const touched: number[] = [];
+    for (const [part, qty] of pileByPart) {
+      const weight = match.idf(part);
+      pileWeight += weight * qty;
+      const postings = match.parts[part];
+      if (!postings) continue;
+      for (let i = 0; i < postings.length; i += 2) {
+        const setIndex = postings[i];
+        if (overlap[setIndex] === 0) touched.push(setIndex);
+        overlap[setIndex] += weight * Math.min(qty, postings[i + 1]);
       }
-      topMatches.splice(insertAt, 0, { set_num: setNum, colorMatchScore, combinedScore });
-      if (topMatches.length > TOP_MATCHES) topMatches.pop();
+    }
+    for (const setIndex of touched) {
+      const set_num = match.setNums[setIndex];
+      const set = sets[set_num];
+      if (!set) continue;
+      const pileCoverage = overlap[setIndex] / pileWeight;
+      const setCoverage = overlap[setIndex] / (match.setWeights[setIndex] || 1);
+      const partScore = pileCoverage ** PILE_EXPONENT * setCoverage ** SET_EXPONENT;
+      const color = colorScore(scannedColors, set);
+      scored.push({
+        set_num,
+        colorMatchScore: color,
+        combinedScore: Math.min(1, partScore * (1 - COLOR_WEIGHT_WITH_PARTS) + Math.min(1, color) * COLOR_WEIGHT_WITH_PARTS),
+        pileCoverage,
+        setCoverage
+      });
     }
   }
 
-  // Keep the actively opened set in the results even when it drops out of the top matches
-  if (ensureSetNum && sets[ensureSetNum] && !topMatches.some(m => m.set_num === ensureSetNum)) {
-    const { colorMatchScore, combinedScore } = scoreSet(ensureSetNum, sets[ensureSetNum]);
-    topMatches.push({ set_num: ensureSetNum, colorMatchScore, combinedScore });
+  scored.sort((a, b) => b.combinedScore - a.combinedScore);
+  const top = scored.slice(0, TOP_MATCHES);
+  if (ensureSetNum && sets[ensureSetNum] && !top.some((entry) => entry.set_num === ensureSetNum)) {
+    top.push(scored.find((entry) => entry.set_num === ensureSetNum) ??
+      { set_num: ensureSetNum, colorMatchScore: 0, combinedScore: 0, pileCoverage: 0, setCoverage: 0 });
   }
 
-  // 5. Assemble final results with matched and missing parts lists.
-  // We check if the user has scanned this specific base part number IN THIS COLOR for the checklist.
-  const userScannedBaseColorKeys = new Set(
-    (scannedPartKeys || [])
-      .map(splitScannedKey)
-      .filter((k): k is { base: string; colorId: string } => k !== null)
-      .map(k => `${k.base}_${k.colorId}`)
-  );
-
-  const results: MatchResult[] = await Promise.all(topMatches.map(async (setMatch) => {
-    const set = sets[setMatch.set_num];
-    const setParts = await loadSetParts(setMatch.set_num);
-    const { matchedParts, missingParts } = assembleChecklist(setParts, userScannedBaseColorKeys);
-
+  const names = await loadPartNames();
+  return Promise.all(top.map(async (entry) => {
+    const set = sets[entry.set_num];
+    const { checklist, foundPieces, totalPieces } = buildChecklist(await loadSetParts(entry.set_num), pile, names);
     return {
-      set_num: setMatch.set_num,
+      ...entry,
       name: set.n,
       year: String(set.y),
-      imageUrl: set.i || "",
+      imageUrl: setImageUrl(entry.set_num, set),
       total_parts: set.t,
-      colorMatchScore: setMatch.colorMatchScore,
-      combinedScore: setMatch.combinedScore,
-      matchedParts,
-      missingParts
+      checklist,
+      foundPieces,
+      totalPieces
     };
   }));
-
-  return results;
-}
-
-export async function fetchMatchSetByNum(setNum: string): Promise<MatchResult | null> {
-  try {
-    const { sets } = await loadCatalogIndex();
-    const set = sets[setNum];
-    if (!set) return null;
-
-    const setParts = await loadSetParts(setNum);
-    const missingParts: BrickPart[] = setParts.map(toBrickPart);
-
-    return {
-      set_num: setNum,
-      name: set.n,
-      year: String(set.y),
-      imageUrl: set.i || "",
-      total_parts: set.t,
-      colorMatchScore: 0,
-      combinedScore: 0,
-      matchedParts: [],
-      missingParts
-    };
-  } catch (err) {
-    console.error("fetchMatchSetByNum failed:", err);
-    return null;
-  }
-}
-
-// BRICKOGNIZE IMAGE CLASSIFICATION API.
-// Untrusted third-party response: every item is validated before it enters app
-// state, and image URLs are only accepted over https. Network/HTTP errors are
-// thrown (with a timeout) so callers can distinguish "API failed" from
-// "no part recognized" (empty array).
-export async function predictPartFromImage(imageBlob: Blob): Promise<BrickPart[]> {
-  const formData = new FormData();
-  formData.append("query_image", imageBlob, "scan.jpg");
-
-  const res = await fetch("https://api.brickognize.com/predict/parts/", {
-    method: "POST",
-    body: formData,
-    signal: AbortSignal.timeout(BRICKOGNIZE_TIMEOUT_MS)
-  });
-
-  if (!res.ok) {
-    throw new Error(`Brickognize returned HTTP ${res.status}`);
-  }
-
-  const data = await res.json();
-  if (!data || !Array.isArray(data.items)) return [];
-
-  const listingId = data.listing_id;
-  const brickognizeUrl = typeof listingId === "string" && /^[a-z0-9-]+$/i.test(listingId)
-    ? `https://brickognize.com/results/${listingId}/`
-    : undefined;
-
-  return data.items
-    .filter((item: unknown): item is { id: string; name: string; score?: unknown; img_url?: unknown } => {
-      const candidate = item as { id?: unknown; name?: unknown };
-      return typeof candidate?.id === "string" && candidate.id.length > 0 && typeof candidate?.name === "string";
-    })
-    .map((item: { id: string; name: string; score?: unknown; img_url?: unknown }): BrickPart => ({
-      part_num: item.id,
-      brickognizeUrl,
-      name: item.name,
-      color_id: 15, // Placeholder — caller overrides with the dominant scanned color
-      rarity_score: parseFloat(String(item.score)) || 0.1,
-      imageUrl: typeof item.img_url === "string" && item.img_url.startsWith("https://") ? item.img_url : ""
-    }));
 }

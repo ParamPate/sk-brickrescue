@@ -1,16 +1,17 @@
 <script lang="ts">
-  import { onDestroy } from "svelte";
-  import type { BrickPart, ScannedColorInput } from "../services/types";
-  import { findPhotoParts } from "../services/photoParts";
-  import { predictPartFromImage } from "../services/api";
+  import type { ScannedColorInput } from "../services/types";
   import { loadColors, resolveColor } from "../services/catalog.svelte";
   import { buildRgbLookup, analyzeDominantColors, sameDominantColors, type RgbLookupEntry } from "../services/colorAnalyzer";
+  import { addPhoto, addPiece, batch } from "../services/batch.svelte";
+  import { estimateColor } from "../services/recognition";
+  import { canvasToBlob, detectPieces, estimateImageColor, fileStem, fileToCanvas } from "../services/imageTools";
 
   const ANALYZE_INTERVAL_MS = 1500;
   const FLASH_DURATION_MS = 400;
   const SCAN_FEEDBACK_MS = 2500;
-  const CAPTURE_JPEG_QUALITY = 0.85;
-  const DEFAULT_COLOR_ID = 15; // Standard White placeholder when no colors were detected yet
+  const CROP_JPEG_QUALITY = 0.9;
+  const PREVIEW_JPEG_QUALITY = 0.85;
+  const IMAGE_FILE = /\.(jpe?g|png|webp|heic|heif|bmp|gif)$/i;
 
   let colorRgbLookup = $state<RgbLookupEntry[]>([]);
 
@@ -22,15 +23,15 @@
   // --- PROPS (Svelte 5 Runes) ---
   interface Props {
     scannedColors: ScannedColorInput[];
-    onPartIdentified: (part: BrickPart) => void;
     selectedPhotoBox?: number | null;
     onSelectPhotoBox?: (box: number | null) => void;
+    onOpenPiece?: (id: string) => void;
   }
   let {
     scannedColors = $bindable(),
-    onPartIdentified,
     selectedPhotoBox = null,
-    onSelectPhotoBox = () => {}
+    onSelectPhotoBox = () => {},
+    onOpenPiece = () => {}
   }: Props = $props();
 
   // --- STATE ---
@@ -39,24 +40,29 @@
   let streamActive = $state<boolean>(false);
   let cameraError = $state<string | null>(null);
   let isFrozen = $state<boolean>(false);
+  let preparing = $state("");
   let showFlash = $state<boolean>(false);
   let tapPosition = $state<{ x: number; y: number } | null>(null);
   let activeStream = $state<MediaStream | null>(null);
   let isCameraRequested = $state(false);
-  let destroyed = false;
-  let photoPreview = $state("");
-  let photoBoxes = $state<{ left: number; top: number; width: number; height: number }[]>([]);
-  let unidentified = $state<{ box: number; imageUrl: string; requestFailed: boolean }[]>([]);
-  let activePhotoBox = $state(-1);
-  onDestroy(() => {
-    destroyed = true;
-    URL.revokeObjectURL(photoPreview);
-  });
+  let captureCount = 0;
 
-  let photoProgress = $state("");
   let photoInput = $state<HTMLInputElement>();
+  let folderInput = $state<HTMLInputElement>();
   let scanFeedback = $state<string | null>(null);
   let scanFeedbackTimeout: ReturnType<typeof setTimeout> | null = null;
+
+  let currentPhoto = $derived(batch.photos.find((photo) => photo.id === batch.currentPhotoId) ?? null);
+  let photoPieces = $derived(currentPhoto ? batch.records.filter((record) => record.photoId === currentPhoto.id) : []);
+  let pieceByBox = $derived(new Map(photoPieces.map((record) => [record.box, record])));
+  let photoStatus = $derived.by(() => {
+    if (!photoPieces.length) return "";
+    const pending = photoPieces.filter((r) => r.status === "queued" || r.status === "processing").length;
+    const recognized = photoPieces.filter((r) => r.status === "done").length;
+    const missed = photoPieces.length - pending - recognized;
+    if (pending) return `Identifying ${photoPieces.length - pending} of ${photoPieces.length} detected pieces…`;
+    return `Recognized ${recognized} of ${photoPieces.length} detected pieces.` + (missed ? ` ${missed} unidentified.` : "");
+  });
 
   const showScanFeedback = (message: string) => {
     scanFeedback = message;
@@ -86,7 +92,7 @@
         let stream: MediaStream;
 
         try {
-          // Versuch 1: Rückkamera (optimal für Handys)
+          // Rear camera first (phones)
           stream = await navigator.mediaDevices.getUserMedia({
             video: { facingMode: "environment" },
             audio: false,
@@ -94,7 +100,6 @@
         } catch (envErr) {
           if (cancelled) return;
           console.warn("Rear camera not available, trying default camera (webcam)...", envErr);
-          // Versuch 2: Beliebige Kamera (Laptop-Webcam)
           stream = await navigator.mediaDevices.getUserMedia({
             video: true,
             audio: false,
@@ -112,7 +117,6 @@
         if (videoElement) {
           videoElement.srcObject = stream;
         } else {
-          // Fallback falls es beim allerersten Frame noch eine Verzögerung beim Binding gibt
           setTimeout(() => {
             if (videoElement) videoElement.srcObject = stream;
           }, 50);
@@ -153,7 +157,6 @@
         const ctx = canvas.getContext("2d");
         if (!ctx) return;
 
-        // Draw video frame to small offscreen canvas to analyze pixels
         ctx.drawImage(videoElement, 0, 0, canvas.width, canvas.height);
         const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
 
@@ -170,206 +173,154 @@
     return () => clearInterval(interval);
   });
 
-  async function recognize(canvas: HTMLCanvasElement, colorId: number, useCrop = false, photoBox?: number) {
-    const blob = await new Promise<Blob | null>((resolve) =>
-      canvas.toBlob(resolve, "image/jpeg", CAPTURE_JPEG_QUALITY)
-    );
-    if (!blob) throw new Error("Could not encode scan image");
+  // Split one photo into piece crops and queue them. Identification runs in the
+  // background (several pieces at once), so the next photo can be prepared
+  // immediately.
+  async function preparePhoto(file: File, lookup: RgbLookupEntry[]) {
+    const canvas = await fileToCanvas(file);
+    const { parts, width, height } = detectPieces(canvas);
+    const stem = fileStem(file.name);
 
-    const [detectedPart] = await predictPartFromImage(blob);
-    if (!detectedPart || destroyed) return false;
-    onPartIdentified({
-      ...detectedPart,
-      color_id: colorId,
-      imageUrl: useCrop ? canvas.toDataURL("image/jpeg", 0.7) : detectedPart.imageUrl,
-      photoBox
-    });
-    return true;
-  }
-
-  async function classifyCapture(canvas: HTMLCanvasElement, useCrop = false) {
-    try {
-      if (!await recognize(canvas, scannedColors[0]?.color_id ?? DEFAULT_COLOR_ID, useCrop)) {
-        showScanFeedback("No part recognized. Try a close-up of one brick.");
-      }
-    } catch (err) {
-      console.error("Error in Brickognize classification:", err);
-      showScanFeedback("Scan failed. Check your connection and try again.");
-    } finally {
-      isFrozen = false;
-      tapPosition = null;
+    if (parts.length === 0) {
+      // A close-up of one piece (or nothing separable): send the whole image.
+      const sample = document.createElement("canvas");
+      sample.width = 64;
+      sample.height = 64;
+      const sampleCtx = sample.getContext("2d", { willReadFrequently: true });
+      sampleCtx?.drawImage(canvas, 0, 0, 64, 64);
+      if (sampleCtx) scannedColors = analyzeDominantColors(sampleCtx.getImageData(0, 0, 64, 64).data, lookup);
+      const blob = await canvasToBlob(canvas, CROP_JPEG_QUALITY);
+      addPiece({ image: `${stem}.jpg`, blob, fallbackColor: estimateImageColor(canvas) });
+      return;
     }
-  }
 
-  async function scanPhoto(event: Event) {
-    const input = event.currentTarget as HTMLInputElement;
-    const file = input.files?.[0];
-    input.value = "";
-    if (!file || isFrozen) return;
-
-    isFrozen = true;
-    scanFeedback = null;
-    photoProgress = "";
-    activePhotoBox = -1;
+    const preview = canvasToBlob(canvas, PREVIEW_JPEG_QUALITY);
+    const photoId = addPhoto(file.name, await preview, parts.map((part) => ({
+      left: part.left / width * 100,
+      top: part.top / height * 100,
+      width: (part.right - part.left + 1) / width * 100,
+      height: (part.bottom - part.top + 1) / height * 100
+    })));
     onSelectPhotoBox(null);
-    try {
-      const image = await createImageBitmap(file);
-      const canvas = document.createElement("canvas");
-      try {
-        const scale = Math.min(1, 2048 / Math.max(image.width, image.height));
-        canvas.width = Math.max(1, Math.round(image.width * scale));
-        canvas.height = Math.max(1, Math.round(image.height * scale));
-        const ctx = canvas.getContext("2d");
-        if (!ctx) throw new Error("Could not get 2D context from canvas");
-        ctx.fillStyle = "white";
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
-        ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
-      } finally {
-        image.close();
-      }
 
-      if (destroyed) return;
-      URL.revokeObjectURL(photoPreview);
-      photoPreview = URL.createObjectURL(file);
-      photoBoxes = [];
-      unidentified = [];
-
-      const detection = document.createElement("canvas");
-      const scale = Math.min(1, 800 / Math.max(canvas.width, canvas.height));
-      detection.width = Math.max(1, Math.round(canvas.width * scale));
-      detection.height = Math.max(1, Math.round(canvas.height * scale));
-      const detector = detection.getContext("2d", { willReadFrequently: true });
-      if (!detector) throw new Error("Could not get 2D context for detecting pieces");
-      detector.drawImage(canvas, 0, 0, detection.width, detection.height);
-      const parts = findPhotoParts(detector.getImageData(0, 0, detection.width, detection.height));
-      photoBoxes = parts.map((part) => ({
-        left: part.left / detection.width * 100,
-        top: part.top / detection.height * 100,
-        width: (part.right - part.left + 1) / detection.width * 100,
-        height: (part.bottom - part.top + 1) / detection.height * 100
-      }));
-      const lookup = buildRgbLookup(await loadColors());
-      isCameraRequested = false;
-      cameraError = null;
-
-      if (parts.length > 0) {
-        const pixels = new Uint8ClampedArray(parts.reduce((size, part) => size + part.pixels.length, 0));
-        let offset = 0;
-        for (const part of parts) {
-          pixels.set(part.pixels, offset);
-          offset += part.pixels.length;
-        }
-        scannedColors = analyzeDominantColors(pixels, lookup);
-        const crop = document.createElement("canvas");
-        const cropCtx = crop.getContext("2d");
-        if (!cropCtx) throw new Error("Could not get 2D context for cropping pieces");
-        const xScale = canvas.width / detection.width;
-        const yScale = canvas.height / detection.height;
-        let recognized = 0;
-        let failed = 0;
-        for (const [index, part] of parts.entries()) {
-          if (destroyed) return;
-          activePhotoBox = index;
-          photoProgress = `Scanning piece ${index + 1} of ${parts.length}…`;
-          const left = Math.max(0, Math.floor((part.left - 5) * xScale));
-          const top = Math.max(0, Math.floor((part.top - 5) * yScale));
-          crop.width = Math.min(canvas.width, Math.ceil((part.right + 6) * xScale)) - left;
-          crop.height = Math.min(canvas.height, Math.ceil((part.bottom + 6) * yScale)) - top;
-          cropCtx.drawImage(canvas, left, top, crop.width, crop.height, 0, 0, crop.width, crop.height);
-          const colorId = analyzeDominantColors(part.pixels, lookup)[0]?.color_id ?? DEFAULT_COLOR_ID;
-          try {
-            if (await recognize(crop, colorId, true, index + 1)) {
-              recognized++;
-            } else if (!destroyed) {
-              unidentified.push({ box: index + 1, imageUrl: crop.toDataURL("image/jpeg", 0.7), requestFailed: false });
-            }
-          } catch (err) {
-            console.error("Error identifying photo crop:", err);
-            failed++;
-            if (!destroyed) {
-              unidentified.push({ box: index + 1, imageUrl: crop.toDataURL("image/jpeg", 0.7), requestFailed: true });
-            }
-          }
-        }
-        photoProgress = `Recognized ${recognized} of ${parts.length} detected pieces.` +
-          (unidentified.length ? ` ${unidentified.length} unidentified.` : "") +
-          (failed ? ` ${failed} requests failed.` : "");
-        return;
-      }
-
-      const sample = canvasElement;
-      const sampleCtx = sample?.getContext("2d");
-      if (!sample || !sampleCtx) throw new Error("Could not get 2D context from sample canvas");
-      sampleCtx.drawImage(canvas, 0, 0, sample.width, sample.height);
-      scannedColors = analyzeDominantColors(
-        sampleCtx.getImageData(0, 0, sample.width, sample.height).data,
-        lookup
-      );
-      await classifyCapture(canvas, true);
-    } catch (err) {
-      console.error("Error preparing scan photo:", err);
-      showScanFeedback("Could not read that photo. Try a JPEG or PNG.");
-    } finally {
-      activePhotoBox = -1;
-      isFrozen = false;
+    const pixels = new Uint8ClampedArray(parts.reduce((size, part) => size + part.pixels.length, 0));
+    let offset = 0;
+    for (const part of parts) {
+      pixels.set(part.pixels, offset);
+      offset += part.pixels.length;
     }
+    scannedColors = analyzeDominantColors(pixels, lookup);
+
+    // Encode every crop in parallel (also avoids per-call throttling in background tabs),
+    // then queue them in photo order.
+    const xScale = canvas.width / width;
+    const yScale = canvas.height / height;
+    const crops = await Promise.all(parts.map((part) => {
+      const crop = document.createElement("canvas");
+      const cropCtx = crop.getContext("2d");
+      if (!cropCtx) throw new Error("Could not get 2D context for cropping pieces");
+      const left = Math.max(0, Math.floor((part.left - 5) * xScale));
+      const top = Math.max(0, Math.floor((part.top - 5) * yScale));
+      crop.width = Math.min(canvas.width, Math.ceil((part.right + 6) * xScale)) - left;
+      crop.height = Math.min(canvas.height, Math.ceil((part.bottom + 6) * yScale)) - top;
+      cropCtx.drawImage(canvas, left, top, crop.width, crop.height, 0, 0, crop.width, crop.height);
+      return canvasToBlob(crop, CROP_JPEG_QUALITY);
+    }));
+    for (const [index, part] of parts.entries()) {
+      addPiece({
+        image: `${stem}_piece${String(index + 1).padStart(2, "0")}.jpg`,
+        blob: crops[index],
+        photoId,
+        box: index + 1,
+        fallbackColor: estimateColor(part.pixels)
+      });
+    }
+  }
+
+  async function scanFiles(files: File[]) {
+    const images = files.filter((file) => file.type.startsWith("image/") || IMAGE_FILE.test(file.name))
+      .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+    if (!images.length) {
+      showScanFeedback("No JPEG or PNG images were selected.");
+      return;
+    }
+    isCameraRequested = false;
+    cameraError = null;
+    scanFeedback = null;
+    const lookup = buildRgbLookup(await loadColors());
+    let failed = 0;
+    for (const [index, file] of images.entries()) {
+      preparing = images.length > 1 ? `Preparing photo ${index + 1} of ${images.length}…` : "Finding pieces…";
+      try {
+        await preparePhoto(file, lookup);
+      } catch (err) {
+        console.error(`Could not read ${file.name}:`, err);
+        failed++;
+      }
+    }
+    preparing = "";
+    if (failed) showScanFeedback(`${failed} file${failed === 1 ? "" : "s"} could not be read. Try JPEG or PNG.`);
+  }
+
+  function onFilesChosen(event: Event) {
+    const input = event.currentTarget as HTMLInputElement;
+    const files = [...(input.files ?? [])];
+    input.value = "";
+    if (files.length) scanFiles(files);
   }
 
   // Core capture and classification logic
   const triggerCapture = async (clickX?: number, clickY?: number) => {
-    if (isFrozen) return;
+    if (isFrozen || !streamActive || !videoElement) return;
 
     if (clickX !== undefined && clickY !== undefined) {
       tapPosition = { x: clickX, y: clickY };
     } else {
-      // Put marker in center of video element or fallback
-      const rect = videoElement ? videoElement.getBoundingClientRect() : { width: 320, height: 240 };
+      const rect = videoElement.getBoundingClientRect();
       tapPosition = { x: rect.width / 2, y: rect.height / 2 };
     }
 
     isFrozen = true;
     showFlash = true;
-
     setTimeout(() => {
       showFlash = false;
     }, FLASH_DURATION_MS);
 
-    if (streamActive && videoElement) {
-      // Real classification with the Brickognize API
-      try {
-        const canvas = document.createElement("canvas");
-        canvas.width = videoElement.videoWidth || 640;
-        canvas.height = videoElement.videoHeight || 480;
-        const ctx = canvas.getContext("2d");
-        if (!ctx) throw new Error("Could not get 2D context from canvas");
-
-        ctx.drawImage(videoElement, 0, 0, canvas.width, canvas.height);
-
-        await classifyCapture(canvas);
-      } catch (err) {
-        console.error("Error during image capture:", err);
-        isFrozen = false;
-        tapPosition = null;
-      }
-    } else {
+    try {
+      const canvas = document.createElement("canvas");
+      canvas.width = videoElement.videoWidth || 640;
+      canvas.height = videoElement.videoHeight || 480;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) throw new Error("Could not get 2D context from canvas");
+      ctx.drawImage(videoElement, 0, 0, canvas.width, canvas.height);
+      const record = await addPiece({
+        image: `capture_${String(++captureCount).padStart(3, "0")}.jpg`,
+        blob: await canvasToBlob(canvas, CROP_JPEG_QUALITY),
+        fallbackColor: estimateImageColor(canvas)
+      });
+      if (record.status === "nomatch") showScanFeedback("No part recognized. Try a close-up of one brick.");
+      else if (record.status === "failed") showScanFeedback("Scan failed. Check your connection and try again.");
+      else if (record.row) showScanFeedback(`${record.row["Part Name"]} · ${record.row["LEGO Color"]}`);
+    } catch (err) {
+      console.error("Error during image capture:", err);
+      showScanFeedback("Scan failed. Try again.");
+    } finally {
       isFrozen = false;
       tapPosition = null;
     }
   };
 
-  // Tap/click to scan handler
   const handleViewportClick = (e: MouseEvent) => {
+    if (!streamActive) return;
     const rect = (e.currentTarget as HTMLDivElement).getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
-    triggerCapture(x, y);
+    triggerCapture(e.clientX - rect.left, e.clientY - rect.top);
   };
 
-  // Handle keydown for Spacebar (to trigger scan on desktop webcams)
+  // Spacebar triggers a scan on desktop webcams
   const handleKeyDown = (e: KeyboardEvent) => {
     if (!streamActive || isFrozen) return;
-    if (e.code === "Space" && !(e.target instanceof HTMLElement && e.target.closest("button, input, a"))) {
-      e.preventDefault(); // Prevent page scrolling
+    if (e.code === "Space" && !(e.target instanceof HTMLElement && e.target.closest("button, input, a, select, dialog"))) {
+      e.preventDefault();
       triggerCapture();
     }
   };
@@ -379,25 +330,33 @@
 
 <section class="main-content" aria-label="Scanner">
   <div class="photo-scan">
-    <input bind:this={photoInput} type="file" accept="image/*" hidden onchange={scanPhoto} />
-    <button class="activate-camera-btn" disabled={isFrozen} onclick={() => photoInput?.click()}>
-      Scan Photo
+    <input bind:this={photoInput} type="file" accept="image/*" multiple hidden onchange={onFilesChosen} />
+    <input bind:this={folderInput} type="file" accept="image/*" multiple hidden webkitdirectory onchange={onFilesChosen} />
+    <button class="activate-camera-btn" disabled={!!preparing} onclick={() => photoInput?.click()}>
+      Scan Photos
     </button>
+    <button class="camera-button" disabled={!!preparing} onclick={() => folderInput?.click()}>Add Folder</button>
     {#if !streamActive && !isCameraRequested}
-      <button class="camera-button" disabled={isFrozen} onclick={() => {
-        photoProgress = "";
-        isCameraRequested = true;
-      }}>Start Camera</button>
+      <button class="camera-button" onclick={() => { isCameraRequested = true; }}>Start Camera</button>
+    {:else}
+      <button class="camera-button" onclick={() => { isCameraRequested = false; }}>Stop Camera</button>
     {/if}
-    <p>Use a close-up or spread pieces apart on a plain, light surface. Brickognize receives images of the pieces for identification.</p>
+    <p>Select one or more photos. Spread pieces apart on a plain, light surface, or use close-ups of single pieces. Brickognize receives images of the pieces for identification.</p>
     {#if !streamActive}
-      <div role="status">{photoProgress || (isFrozen ? "Processing image..." : scanFeedback ?? "")}</div>
+      <div role="status">{preparing || scanFeedback || photoStatus}</div>
+    {/if}
+    {#if batch.photos.length > 1 && !streamActive}
+      <label class="photo-switch">Photo
+        <select value={batch.currentPhotoId} onchange={(e) => { batch.currentPhotoId = e.currentTarget.value; onSelectPhotoBox(null); }}>
+          {#each batch.photos as photo (photo.id)}<option value={photo.id}>{photo.name}</option>{/each}
+        </select>
+      </label>
     {/if}
   </div>
 
   <!-- svelte-ignore a11y_click_events_have_key_events -->
   <!-- svelte-ignore a11y_no_static_element_interactions -->
-  <div class="scanner-viewport" class:photo-viewport={!streamActive && !!photoPreview && !isCameraRequested} onclick={handleViewportClick} style="cursor: {streamActive && !isFrozen ? 'crosshair' : 'default'}">
+  <div class="scanner-viewport" class:photo-viewport={!streamActive && !!currentPhoto?.url && !isCameraRequested} onclick={handleViewportClick} style="cursor: {streamActive && !isFrozen ? 'crosshair' : 'default'}">
     <video
       bind:this={videoElement}
       autoplay
@@ -408,16 +367,22 @@
       <track kind="captions" />
     </video>
 
-    {#if !streamActive && photoPreview && !isCameraRequested}
-      <img class="photo-preview" src={photoPreview} alt="LEGO pieces selected for scanning" />
-      <div class="photo-boxes" aria-hidden="true">
-        {#each photoBoxes as box, index}
-          <div class="photo-box" class:active={index === activePhotoBox || selectedPhotoBox === index + 1}
-            class:unidentified={unidentified.some((piece) => piece.box === index + 1)}
+    {#if !streamActive && currentPhoto?.url && !isCameraRequested}
+      <img class="photo-preview" src={currentPhoto.url} alt="LEGO pieces selected for scanning" />
+      <div class="photo-boxes">
+        {#each currentPhoto.boxes as box, index (index)}
+          {@const piece = pieceByBox.get(index + 1)}
+          <button type="button" class="photo-box"
+            class:active={piece?.status === "processing" || selectedPhotoBox === index + 1}
+            class:unidentified={piece?.status === "nomatch" || piece?.status === "failed"}
+            class:pending={piece?.status === "queued"}
             style:left={box.left + "%"} style:top={box.top + "%"}
-            style:width={box.width + "%"} style:height={box.height + "%"}>
+            style:width={box.width + "%"} style:height={box.height + "%"}
+            aria-label={`Review piece ${index + 1}${piece?.row ? `: ${piece.row["Part Name"]}` : ""}`}
+            title={piece?.row ? `${piece.row["Part ID"]} · ${piece.row["Part Name"]} · ${piece.row["LEGO Color"]}` : `Piece ${index + 1}`}
+            onclick={(event) => { event.stopPropagation(); onSelectPhotoBox(index + 1); if (piece) onOpenPiece(piece.id); }}>
             <span>{index + 1}</span>
-          </div>
+          </button>
         {/each}
       </div>
     {:else if !streamActive}
@@ -440,7 +405,7 @@
           {:else}
             <div class="camera-fallback-title">Ready to scan</div>
             <div class="camera-fallback-desc">
-              Upload a photo or start the camera.
+              Upload photos or start the camera.
             </div>
           {/if}
         {/if}
@@ -456,8 +421,6 @@
     <!-- Scan HUD Overlay -->
     {#if streamActive}
       <div class="scanner-overlay">
-
-
         <!-- Persistent amber viewfinder brackets — a target for placing a brick. -->
         <div class="viewfinder {isFrozen ? 'active' : ''}">
           <span class="viewfinder-corner tl"></span>
@@ -466,7 +429,6 @@
           <span class="viewfinder-corner br"></span>
         </div>
 
-        <!-- Tap Marker -->
         {#if tapPosition}
           <div class="tap-marker" style="top: {tapPosition.y}px; left: {tapPosition.x}px;"></div>
         {/if}
@@ -485,23 +447,6 @@
       </div>
     {/if}
   </div>
-
-  {#if unidentified.length && !streamActive}
-    <details class="unidentified-pieces">
-      <summary>Review unidentified pieces ({unidentified.length})</summary>
-      <ul>
-        {#each unidentified as piece (piece.box)}
-          <li>
-            <a href={piece.imageUrl} download={`piece-${piece.box}.jpg`}>
-              <img src={piece.imageUrl} alt={`Piece ${piece.box}`} />
-              <span>Box {piece.box}</span>
-            </a>
-            <span>{piece.requestFailed ? "Request failed" : "No match returned"}</span>
-          </li>
-        {/each}
-      </ul>
-    </details>
-  {/if}
 
   <!-- Color Profile Bar -->
   <div class="color-profile-panel">
@@ -577,6 +522,10 @@
 
   .photo-box {
     position: absolute;
+    padding: 0;
+    background: transparent;
+    cursor: pointer;
+    pointer-events: auto;
     border: 2px solid #36563f;
     box-shadow: 0 0 0 1px #fff;
     border-radius: 3px;
@@ -592,35 +541,29 @@
     font-size: 0.65rem;
   }
 
+  .photo-box.pending {
+    border-style: dotted;
+    opacity: 0.75;
+  }
+
+  .photo-switch {
+    display: block;
+    margin-top: 0.5rem;
+    font-size: 0.875rem;
+  }
+
+  .photo-switch select {
+    margin-left: 6px;
+    max-width: 70%;
+    font: inherit;
+  }
+
   .photo-box.unidentified {
     border: 2px dashed #a83b37;
   }
 
   .photo-box.unidentified span {
     background: #a83b37;
-  }
-
-  .unidentified-pieces {
-    padding: 12px 16px;
-  }
-
-  .unidentified-pieces ul {
-    list-style: none;
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
-    gap: 8px;
-    margin-top: 8px;
-  }
-
-  .unidentified-pieces li {
-    font-size: 0.8rem;
-  }
-
-  .unidentified-pieces img {
-    display: block;
-    width: 100%;
-    height: 75px;
-    object-fit: contain;
   }
 
   .photo-box.active {

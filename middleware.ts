@@ -2,7 +2,7 @@
 // (see docs/VERCEL.md). Skips static catalog data and build assets so the large
 // JSON downloads do not invoke the edge function on every request.
 export const config = {
-  matcher: ["/((?!catalog/|assets/|fonts/|favicon\\.svg|logo\\.svg).*)"],
+  matcher: ["/((?!catalog/|data/|assets/|fonts/|favicon\\.svg|logo\\.svg).*)"],
 };
 
 // Constant-time comparison via SHA-256 digests: digest length is fixed, so the

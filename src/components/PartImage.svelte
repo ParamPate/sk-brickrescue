@@ -24,7 +24,7 @@
 
 <div class="{wrapperClass} {showImage ? '' : 'placeholder'}">
   {#if showImage}
-    <img {src} {alt} class={imgClass} onerror={() => { failed = true; }} />
+    <img {src} {alt} class={imgClass} loading="lazy" decoding="async" onerror={() => { failed = true; }} />
   {:else if colorHex}
     <div class={fallbackClass} style="background-color: {colorHex}"></div>
   {:else}

@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { COLORS } from "./colorPalette";
-import { fetchMatchSets, fetchMatchSetByNum, predictPartFromImage, getBasePartNum } from "./api";
-import { clearCatalogCache, shardKeyForSet, type CatalogSetPart } from "./catalog.svelte";
+import { buildChecklist, fetchMatchSets, getBasePartNum } from "./api";
+import { canonicalPart, clearCatalogCache, shardKeyForSet, type SetPartRow } from "./catalog.svelte";
 
 describe("BrickRelic - Color Metadata", () => {
   it("should contain standard colors", () => {
@@ -16,6 +16,7 @@ describe("BrickRelic - Base Part Number Stripping", () => {
     expect(getBasePartNum("3001pr0002")).toBe("3001");
     expect(getBasePartNum("973pat0123")).toBe("973");
     expect(getBasePartNum("3004sp01")).toBe("3004");
+    expect(getBasePartNum("39367pb01")).toBe("39367"); // BrickLink print suffix
   });
 
   it("keeps mold letters as part of the base", () => {
@@ -35,365 +36,159 @@ describe("BrickRelic - Base Part Number Stripping", () => {
   });
 });
 
-// --- Mock catalog helpers (new split format: sets-index + set-parts shards) ---
+// --- Mock catalog (sets-index + match-index + set-parts shards + part names) ---
 
-type MockSet = {
-  n: string;
-  y: number;
-  t: number;
-  i: string | null;
-  d: number;
-  c: Record<string, number>;
-  p: CatalogSetPart[];
-};
+type MockSet = { n: string; y: number; t: number; c: Record<string, number>; rows: SetPartRow[] };
 
 const mockColors = {
-  "0": { "name": "Black", "hex": "#1b1b1b" },
-  "15": { "name": "White", "hex": "#f2f3f2" },
-  "4": { "name": "Red", "hex": "#c91a09" }
+  "0": { name: "Black", hex: "#1b1b1b" },
+  "15": { name: "White", hex: "#f2f3f2" },
+  "4": { name: "Red", hex: "#c91a09" }
 };
 
-function makeCatalogFetchMock(sets: Record<string, MockSet>, parts: Record<string, { r: number; s: string[] }>) {
+function makeCatalogFetchMock(sets: Record<string, MockSet>, aliases: Record<string, string> = {}, molds: Record<string, string> = {}) {
+  const setNums = Object.keys(sets).sort();
+  const parts: Record<string, number[]> = {};
+  setNums.forEach((setNum, index) => {
+    const byPart = new Map<string, number>();
+    for (const [part, , qty] of sets[setNum].rows) {
+      const canonical = aliases[getBasePartNum(part)] ?? getBasePartNum(part);
+      byPart.set(canonical, (byPart.get(canonical) || 0) + qty);
+    }
+    for (const [part, qty] of byPart) (parts[part] ??= []).push(index, qty);
+  });
   return vi.fn((url: string) => {
     let data: unknown = {};
-    if (url.endsWith("colors.json")) {
-      data = mockColors;
-    } else if (url.endsWith("sets-index.json")) {
-      const index: Record<string, unknown> = {};
-      for (const setNum in sets) {
-        const { p: _p, ...rest } = sets[setNum];
-        index[setNum] = rest;
-      }
-      data = index;
-    } else if (url.endsWith("parts.json")) {
-      data = parts;
-    } else if (url.includes("/set-parts/")) {
+    if (url.endsWith("colors.json")) data = mockColors;
+    else if (url.endsWith("sets-index.json")) {
+      data = Object.fromEntries(setNums.map((setNum) => {
+        const { rows: _rows, ...entry } = sets[setNum];
+        return [setNum, entry];
+      }));
+    } else if (url.endsWith("match-index.json")) data = { sets: setNums, parts, aliases, molds };
+    else if (url.endsWith("part-names.json")) data = { "3001": "Brick 2 x 4", "3002": "Brick 2 x 3" };
+    else if (url.includes("/set-parts/")) {
       const shard = url.substring(url.lastIndexOf("/") + 1).replace(".json", "");
-      const shardData: Record<string, CatalogSetPart[]> = {};
-      for (const setNum in sets) {
-        if (shardKeyForSet(setNum) === shard) shardData[setNum] = sets[setNum].p;
-      }
-      data = shardData;
+      data = Object.fromEntries(setNums.filter((setNum) => shardKeyForSet(setNum) === shard).map((setNum) => [setNum, sets[setNum].rows]));
     }
-    return Promise.resolve({
-      ok: true,
-      json: () => Promise.resolve(data)
-    });
+    return Promise.resolve({ ok: true, json: () => Promise.resolve(data) });
   });
 }
 
+// A small themed set, a huge set made of common pieces, and a color-only candidate.
 const defaultSets: Record<string, MockSet> = {
   "6285-1": {
-    n: "Black Seas Barracuda",
-    y: 1989,
-    t: 909,
-    i: "https://example.com/6285.jpg",
-    d: 0.20, // Sum of diagnostic rarities (0.05 for 3001 + 0.15 for 3002)
-    c: { "0": 50.0, "15": 50.0 }, // 50% Black, 50% White
-    p: [
-      { p: "3001", c: 15, r: 0.05, i: "3001.jpg", nm: "Brick 2 x 4" },
-      { p: "3002", c: 0, r: 0.15, i: "3002.jpg" }
-    ]
+    n: "Black Seas Barracuda", y: 1989, t: 30, c: { "0": 50, "15": 50 },
+    rows: [["3001", 15, 10, "elements/1.jpg"], ["3002", 0, 10, ""], ["rare1", 0, 2, ""], ["pin", 0, 8, ""]]
+  },
+  "9999-1": {
+    n: "Huge Common Set", y: 2020, t: 3000, c: { "4": 100 },
+    rows: [["pin", 4, 2000, ""], ["3001", 4, 500, ""], ["3002", 4, 500, ""]]
   },
   "6286-1": {
-    n: "Skull's Eye Schooner",
-    y: 1993,
-    t: 912,
-    i: "https://example.com/6286.jpg",
-    d: 0.15,
-    c: { "0": 100.0 }, // 100% Black
-    p: [
-      { p: "3002", c: 0, r: 0.15, i: "3002.jpg" }
-    ]
+    n: "Skull's Eye Schooner", y: 1993, t: 20, c: { "0": 100 },
+    rows: [["3002", 0, 20, ""]]
   }
 };
+// Make "pin" appear in many sets so it is a low-weight common part.
+for (let i = 0; i < 20; i++) defaultSets[`p${i}-1`] = { n: `Pin pack ${i}`, y: 2000, t: 5, c: { "0": 100 }, rows: [["pin", 0, 5, ""]] };
 
-const defaultParts = {
-  "3001": { r: 0.05, s: ["6285-1"] },
-  "3002": { r: 0.15, s: ["6285-1", "6286-1"] }
-};
-
-describe("BrickRelic - Client-Side Matching Algorithm", () => {
+describe("BrickRelic - Full-inventory set matching", () => {
   beforeEach(() => {
     clearCatalogCache();
-    vi.stubGlobal("fetch", makeCatalogFetchMock(defaultSets, defaultParts));
+    vi.stubGlobal("fetch", makeCatalogFetchMock(defaultSets));
   });
 
-  it("should match sets based purely on color profile if no parts are scanned", async () => {
-    const scannedColors = [
-      { color_id: 0, weight: 0.5 },
-      { color_id: 15, weight: 0.5 }
-    ];
-    const results = await fetchMatchSets(scannedColors, []);
-
-    expect(results.length).toBeGreaterThan(0);
-    // Black Seas Barracuda has 50% Black and 50% White, so it should match 100% (1.0 score)
-    const barracuda = results.find(r => r.set_num === "6285-1");
-    expect(barracuda).toBeDefined();
-    expect(barracuda?.colorMatchScore).toBeCloseTo(1.0, 2);
-    expect(barracuda?.combinedScore).toBeCloseTo(1.0, 2);
-
-    // Skull's Eye Schooner has 100% Black, so matching weight of 0.5 Black should yield 0.5 score
-    const schooner = results.find(r => r.set_num === "6286-1");
-    expect(schooner).toBeDefined();
-    expect(schooner?.colorMatchScore).toBeCloseTo(0.5, 2);
+  it("ranks by color profile when no parts are scanned, clamped to 1.0", async () => {
+    const results = await fetchMatchSets([{ color_id: 0, weight: 0.6 }, { color_id: 15, weight: 0.5 }], []);
+    expect(results[0].set_num).toBe("6285-1");
+    expect(results[0].combinedScore).toBeLessThanOrEqual(1);
   });
 
-  it("should clamp the color-only combined score to 1.0 when rounded weights sum above 1", async () => {
-    // toFixed(2)-rounded camera weights can sum to 1.01 — the display score must not exceed 100%
-    const scannedColors = [
-      { color_id: 0, weight: 0.51 },
-      { color_id: 15, weight: 0.5 }
-    ];
-    const results = await fetchMatchSets(scannedColors, []);
-    const barracuda = results.find(r => r.set_num === "6285-1");
-    expect(barracuda?.combinedScore).toBeLessThanOrEqual(1.0);
+  it("finds the set that contains the scanned pile, not the biggest set", async () => {
+    const results = await fetchMatchSets([], [
+      { part: "3001", color: 15, qty: 5 },
+      { part: "3002", color: 0, qty: 5 },
+      { part: "rare1", color: 0, qty: 1 },
+      { part: "pin", color: 0, qty: 4 }
+    ]);
+    expect(results[0].set_num).toBe("6285-1");
+    expect(results[0].pileCoverage).toBeCloseTo(1, 5);
+    expect(results.length).toBeLessThanOrEqual(3);
+    expect(results.find((r) => r.set_num === "9999-1")?.combinedScore ?? 0).toBeLessThan(results[0].combinedScore);
   });
 
-  it("should match sets based on 70% part rarity and 30% color profile when parts are scanned", async () => {
-    const scannedColors = [
-      { color_id: 0, weight: 0.5 },
-      { color_id: 15, weight: 0.5 }
-    ];
-    // Scan part 3001 (White color key)
-    const scannedPartKeys = ["3001_15"];
-    const results = await fetchMatchSets(scannedColors, scannedPartKeys);
-
-    const barracuda = results.find(r => r.set_num === "6285-1");
-    expect(barracuda).toBeDefined();
-
-    // Matched rarity sum for Barracuda: 0.05
-    // Total scanned rarity: 0.05
-    // Part match ratio: 0.05 / 0.05 = 1.0
-    // Color match: 1.0
-    // Combined score: 1.0 * 0.7 + 1.0 * 0.3 = 1.0
-    expect(barracuda?.combinedScore).toBeCloseTo(1.0, 2);
-
-    // Skull's Eye Schooner does NOT contain part 3001, so it gets penalized (color score * 0.1)
-    const schooner = results.find(r => r.set_num === "6286-1");
-    expect(schooner).toBeDefined();
-    expect(schooner?.combinedScore).toBeCloseTo(0.05, 2); // 0.5 * 0.1
+  it("matches parts regardless of the scanned color", async () => {
+    const results = await fetchMatchSets([], [{ part: "rare1", color: 4, qty: 2 }, { part: "3001", color: 4, qty: 10 }]);
+    expect(results[0].set_num).toBe("6285-1");
+    const line = results[0].checklist.find((part) => part.part_num === "rare1")!;
+    expect(line).toMatchObject({ found: 2, quantity: 2, colorMismatch: true });
   });
 
-  it("should support suffix stripping for printed part suffixes and color suffixes", async () => {
-    const scannedColors = [
-      { color_id: 0, weight: 0.5 },
-      { color_id: 15, weight: 0.5 }
-    ];
-    // Scan part 3001 with a printed suffix "pr0002" and color suffix "_15"
-    const scannedPartKeys = ["3001pr0002_15"];
-    const results = await fetchMatchSets(scannedColors, scannedPartKeys);
-
-    const barracuda = results.find(r => r.set_num === "6285-1");
-    expect(barracuda).toBeDefined();
-    // It should strip the suffixes to "3001", identify it as a match, and compute score 1.0
-    expect(barracuda?.combinedScore).toBeCloseTo(1.0, 2);
-    expect(barracuda?.matchedParts.map(p => p.part_num)).toContain("3001");
+  it("merges mold variants and prints through the alias table", async () => {
+    clearCatalogCache();
+    vi.stubGlobal("fetch", makeCatalogFetchMock(defaultSets, { "61332": "pin", "4459": "rare1" }));
+    const results = await fetchMatchSets([], [{ part: "4459pr0001", color: 0, qty: 2 }]);
+    expect(canonicalPart("61332")).toBe("pin");
+    expect(results[0].set_num).toBe("6285-1");
   });
 
-  it("should not crash or over-match when scanning a non-numeric ID (phantom part regression)", async () => {
-    const scannedColors = [{ color_id: 15, weight: 1.0 }];
-    // Previously "cardupn0015pr0001" collapsed to "" and matched a phantom part
-    // with rarity 1.0 across 118 sets.
-    const results = await fetchMatchSets(scannedColors, ["cardupn0015pr0001_15"]);
-
-    // The scanned card is unknown to the catalog: every set is a part mismatch
-    // and gets the color penalty, never a rarity boost.
-    for (const res of results) {
-      expect(res.combinedScore).toBeLessThanOrEqual(0.1);
-    }
+  it("does not crash on unknown or non-numeric IDs (phantom part regression)", async () => {
+    const results = await fetchMatchSets([], [{ part: "cardupn0015pr0001", color: 15, qty: 1 }]);
+    expect(results).toEqual([]);
   });
 
-  it("should match parts color-dependently in checklist while keeping overall set matching color-independent", async () => {
-    const scannedColors = [
-      { color_id: 0, weight: 0.5 },
-      { color_id: 15, weight: 0.5 }
-    ];
-    // REQ-RAD-006a: Scan part 3001 in Black (color 0) instead of White (color 15).
-    // Set 6285-1 contains 3001 only in White (15) — NOT in Black (0). Because the set does
-    // not contain 3001 in the (mis-)classified color 0, the checklist MUST fall back to
-    // matching 3001_15 color-independently.
-    const scannedPartKeys = ["3001_0"];
-    const results = await fetchMatchSets(scannedColors, scannedPartKeys);
-
-    const barracuda = results.find(r => r.set_num === "6285-1");
-    expect(barracuda).toBeDefined();
-
-    // Part match for set scoring is base-part-independent (still matches base part 3001 to set scoring)
-    expect(barracuda?.combinedScore).toBeCloseTo(1.0, 2);
-
-    // checklist matching: Since 3001_0 doesn't exist in set (only 3001_15), it falls back to 3001_15!
-    expect(barracuda?.matchedParts.map(p => p.part_num + "_" + p.color_id)).toContain("3001_15");
-    expect(barracuda?.missingParts.map(p => p.part_num + "_" + p.color_id)).not.toContain("3001_15");
-
-    // FIND-046: the fallback-matched part must carry the ACTUAL scanned key (3001_0),
-    // not its own catalog key (3001_15) — otherwise un-marking cannot find the scanned
-    // entry in foundParts and the mis-tap sticks (REQ-RAD-007).
-    const fallbackMatched = barracuda?.matchedParts.find(p => p.part_num === "3001");
-    expect(fallbackMatched?.matchedScanKey).toBe("3001_0");
+  it("always includes the ensured set even when it is not a top match", async () => {
+    const results = await fetchMatchSets([], [{ part: "3001", color: 15, qty: 1 }], "p7-1");
+    expect(results.some((r) => r.set_num === "p7-1")).toBe(true);
   });
 
-  it("should enforce color-dependent matching when the set contains the part in both colors", async () => {
-    // REQ-RAD-006a: "If a set contains the part in multiple colors (including the classified
-    // color), the matching MUST remain strictly color-dependent."
-    const scannedColors = [
-      { color_id: 0, weight: 0.5 },
-      { color_id: 15, weight: 0.5 }
-    ];
-    vi.stubGlobal("fetch", makeCatalogFetchMock({
-      "6285-1": {
-        n: "Black Seas Barracuda",
-        y: 1989,
-        t: 909,
-        i: "https://example.com/6285.jpg",
-        d: 0.10,
-        c: { "0": 50.0, "15": 50.0 },
-        p: [
-          { p: "3001", c: 0, r: 0.05, i: "3001.jpg" },
-          { p: "3001", c: 15, r: 0.05, i: "3001.jpg" }
-        ]
-      }
-    }, { "3001": { r: 0.05, s: ["6285-1"] } }));
-
-    // Scan 3001 in Black (0). Since the set DOES contain 3001 in Black, the fallback MUST NOT
-    // fire: 3001_0 matches directly, but 3001_15 stays missing (strict color-dependence).
-    const scannedPartKeys = ["3001_0"];
-    const results = await fetchMatchSets(scannedColors, scannedPartKeys);
-    const barracuda = results.find(r => r.set_num === "6285-1");
-
-    expect(barracuda?.matchedParts.map(p => p.part_num + "_" + p.color_id)).toContain("3001_0");
-    expect(barracuda?.matchedParts.map(p => p.part_num + "_" + p.color_id)).not.toContain("3001_15");
-    expect(barracuda?.missingParts.map(p => p.part_num + "_" + p.color_id)).toContain("3001_15");
-
-    // Direct color match: matchedScanKey equals the part's own key (3001_0).
-    const directMatched = barracuda?.matchedParts.find(p => p.part_num === "3001");
-    expect(directMatched?.matchedScanKey).toBe("3001_0");
-  });
-
-  it("should be case-insensitive when matching parts in the checklist", async () => {
-    const scannedColors = [
-      { color_id: 15, weight: 1.0 }
-    ];
-    // Scan lowercase part key "3001a_15"; the set stores the base part uppercase as "3001A".
-    const scannedPartKeys = ["3001a_15"];
-
-    vi.stubGlobal("fetch", makeCatalogFetchMock({
-      "6285-1": {
-        n: "Black Seas Barracuda",
-        y: 1989,
-        t: 909,
-        i: "https://example.com/6285.jpg",
-        d: 0.20,
-        c: { "15": 100.0 },
-        p: [
-          { p: "3001A", c: 15, r: 0.05, i: "3001.jpg" }
-        ]
-      }
-    }, { "3001A": { r: 0.05, s: ["6285-1"] } }));
-
-    const results = await fetchMatchSets(scannedColors, scannedPartKeys);
-    const barracuda = results.find(r => r.set_num === "6285-1");
-    expect(barracuda?.matchedParts.map(p => p.part_num)).toContain("3001A");
-  });
-
-  it("should always include the ensured set even when it is not a top match", async () => {
-    // Four sets with a perfect color match push the weak set out of the top 3
-    const sets: Record<string, MockSet> = {};
-    for (const num of ["1001-1", "1002-1", "1003-1"]) {
-      sets[num] = {
-        n: `Strong ${num}`, y: 2000, t: 100, i: null, d: 0.1,
-        c: { "0": 100.0 },
-        p: [{ p: "3002", c: 0, r: 0.15, i: null }]
-      };
-    }
-    sets["9999-1"] = {
-      n: "Weak Set", y: 2001, t: 50, i: null, d: 0.1,
-      c: { "0": 1.0 },
-      p: [{ p: "3010", c: 0, r: 0.2, i: null }]
-    };
-    vi.stubGlobal("fetch", makeCatalogFetchMock(sets, { "3002": { r: 0.15, s: ["1001-1", "1002-1", "1003-1"] } }));
-
-    const scannedColors = [{ color_id: 0, weight: 1.0 }];
-
-    const withoutEnsure = await fetchMatchSets(scannedColors, []);
-    expect(withoutEnsure.map(r => r.set_num)).not.toContain("9999-1");
-
-    const withEnsure = await fetchMatchSets(scannedColors, [], "9999-1");
-    expect(withEnsure.map(r => r.set_num)).toContain("9999-1");
-    // The top matches themselves stay unchanged
-    expect(withEnsure.filter(r => r.set_num !== "9999-1")).toHaveLength(3);
-  });
-
-  it("should retry after a failed catalog load instead of caching the rejection forever", async () => {
-    let failing = true;
+  it("retries after a failed catalog load instead of caching the rejection forever", async () => {
+    clearCatalogCache();
+    let fail = true;
+    const working = makeCatalogFetchMock(defaultSets);
     vi.stubGlobal("fetch", vi.fn((url: string) => {
-      if (failing && url.endsWith("sets-index.json")) {
-        return Promise.resolve({ ok: false, json: () => Promise.resolve({}) });
-      }
-      return makeCatalogFetchMock(defaultSets, defaultParts)(url);
+      if (fail && url.endsWith("match-index.json")) return Promise.resolve({ ok: false, json: () => Promise.resolve({}) });
+      return working(url);
     }));
-
-    const scannedColors = [{ color_id: 0, weight: 1.0 }];
-    await expect(fetchMatchSets(scannedColors, [])).rejects.toThrow();
-
-    // Network recovers: the same call must now succeed without a page reload
-    failing = false;
-    const results = await fetchMatchSets(scannedColors, []);
+    await expect(fetchMatchSets([], [{ part: "3001", color: 15, qty: 1 }])).rejects.toThrow();
+    fail = false;
+    const results = await fetchMatchSets([], [{ part: "3001", color: 15, qty: 1 }]);
     expect(results.length).toBeGreaterThan(0);
-  });
-
-  it("should resolve a single set with all parts missing via fetchMatchSetByNum", async () => {
-    const result = await fetchMatchSetByNum("6285-1");
-    expect(result).not.toBeNull();
-    expect(result?.name).toBe("Black Seas Barracuda");
-    expect(result?.matchedParts).toHaveLength(0);
-    expect(result?.missingParts.map(p => p.part_num)).toEqual(["3001", "3002"]);
-
-    const unknown = await fetchMatchSetByNum("0000-0");
-    expect(unknown).toBeNull();
   });
 });
 
-describe("BrickRelic - Brickognize API Hardening", () => {
-  const makeBlob = () => new Blob(["fake-image"], { type: "image/jpeg" });
-
-  beforeEach(() => {
+describe("BrickRelic - Recoloring candidates", () => {
+  it("offers recoloring only for the same physical part, never for alternates", async () => {
     clearCatalogCache();
+    vi.stubGlobal("fetch", makeCatalogFetchMock({
+      "45680-1": { n: "Spike", y: 2020, t: 8, c: {}, rows: [["2780", 0, 2, ""], ["3673", 71, 4, ""], ["32524", 73, 2, ""]] }
+    }, { "61332": "2780", "3673": "2780" }, { "61332": "2780" }));
+    const [result] = await fetchMatchSets([], [
+      { part: "61332", color: 0, qty: 6 }, // 2 black friction pins too many
+      { part: "32524", color: 3, qty: 2 } // beam read as the wrong color
+    ]);
+    const smooth = result.checklist.find((p) => p.part_num === "3673")!;
+    const beam = result.checklist.find((p) => p.part_num === "32524")!;
+    expect(smooth).toMatchObject({ found: 4, colorMismatch: true, borrowed: [] });
+    expect(beam.borrowed).toEqual([{ color: 3, qty: 2, part: "32524" }]);
   });
+});
 
-  it("throws on HTTP errors instead of swallowing them", async () => {
-    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve({ ok: false, status: 503 })));
-    await expect(predictPartFromImage(makeBlob())).rejects.toThrow("HTTP 503");
-  });
-
-  it("returns an empty list for malformed payloads", async () => {
-    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve({
-      ok: true,
-      json: () => Promise.resolve({ unexpected: true })
-    })));
-    await expect(predictPartFromImage(makeBlob())).resolves.toEqual([]);
-  });
-
-  it("filters invalid items and rejects non-https image URLs", async () => {
-    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve({
-      ok: true,
-      json: () => Promise.resolve({
-        listing_id: "res-d492bca0",
-        items: [
-          { id: "3001", name: "Brick 2 x 4", score: "0.92", img_url: "https://cdn.example.com/3001.png" },
-          { id: "3002", name: "Brick 2 x 2", score: 0.5, img_url: "http://insecure.example.com/3002.png" },
-          { id: 12345, name: "Numeric id — invalid" },
-          { name: "Missing id — invalid" },
-          { id: "", name: "Empty id — invalid" }
-        ]
-      })
-    })));
-
-    const parts = await predictPartFromImage(makeBlob());
-    expect(parts.map(p => p.part_num)).toEqual(["3001", "3002"]);
-    expect(parts[0].brickognizeUrl).toBe("https://brickognize.com/results/res-d492bca0/");
-    expect(parts[0].imageUrl).toBe("https://cdn.example.com/3001.png");
-    expect(parts[0].rarity_score).toBeCloseTo(0.92);
-    expect(parts[1].imageUrl).toBe(""); // http:// URL dropped
+describe("BrickRelic - Checklist", () => {
+  it("fills the exact color first, caps at the set quantity and lists missing lines first", () => {
+    const rows: SetPartRow[] = [["3001", 15, 2, "elements/1.jpg"], ["3001", 0, 2, ""], ["3002", 0, 1, ""]];
+    const { checklist, foundPieces, totalPieces } = buildChecklist(rows, [
+      { part: "3001", color: 0, qty: 3 },
+      { part: "3002", color: 0, qty: 5 }
+    ], { "3001": "Brick 2 x 4" });
+    expect(totalPieces).toBe(5);
+    expect(foundPieces).toBe(4);
+    const black = checklist.find((p) => p.part_num === "3001" && p.color_id === 0)!;
+    const white = checklist.find((p) => p.part_num === "3001" && p.color_id === 15)!;
+    expect(black).toMatchObject({ found: 2, colorMismatch: false, name: "Brick 2 x 4" });
+    expect(white).toMatchObject({ found: 1, colorMismatch: true, imageUrl: "https://cdn.rebrickable.com/media/parts/elements/1.jpg" });
+    expect(checklist[0]).toBe(white); // still missing one
+    expect(checklist.find((p) => p.part_num === "3002")!.name).toBe("Part 3002");
   });
 });

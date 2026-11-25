@@ -6,46 +6,51 @@ export interface CatalogColor {
   hex: string;
 }
 
-export interface CatalogSetPart {
-  p: string; // part_num
-  c: number; // color_id
-  r: number; // rarity_score
-  i: string | null; // image_url
-  nm?: string | null; // part name
-}
+// One row of a set's full inventory: [part_num, color_id, quantity, image]
+// where image is a path under IMG_PREFIX or a full URL ("" when none).
+export type SetPartRow = [string, number, number, string];
 
 export interface CatalogSetIndexEntry {
   n: string; // name
   y: number; // year
   t: number; // total_parts
-  i: string | null; // image_url
-  d: number; // diagnostic_rarity_sum
+  i?: string; // image_url when it differs from the default Rebrickable URL
   c: Record<number, number>; // color profile (color_id -> percentage 0..100)
 }
 
-export interface CatalogPartInfo {
-  r: number; // max rarity of the base part
-  s: string[]; // set numbers containing the base part
+// Full-inventory matching data: canonical part -> postings [setIndex, qty, ...]
+export interface MatchIndex {
+  setNums: string[];
+  parts: Record<string, number[]>;
+  aliases: Record<string, string>;
+  molds: Record<string, string>;
+  // Inverse document frequency per canonical part (rare parts weigh more)
+  idf: (canonical: string) => number;
+  // Sum of idf × quantity over each set's inventory, by set index
+  setWeights: Float64Array;
 }
+
+const IMG_PREFIX = "https://cdn.rebrickable.com/media/parts/";
 
 // Reactive color table: templates calling resolveColor() re-render automatically
 // once the catalog colors arrive — no manual {#key} re-mount needed.
 let colors = $state<Record<number, CatalogColor> | null>(null);
 
-let setsIndexCache: Record<string, CatalogSetIndexEntry> | null = null;
-let partsCache: Record<string, CatalogPartInfo> | null = null;
-
 let colorsLoadPromise: Promise<Record<number, CatalogColor>> | null = null;
-let indexLoadPromise: Promise<{ sets: Record<string, CatalogSetIndexEntry>; parts: Record<string, CatalogPartInfo> }> | null = null;
-const setPartsShardCache = new Map<string, Record<string, CatalogSetPart[]>>();
-const setPartsShardPromises = new Map<string, Promise<Record<string, CatalogSetPart[]>>>();
+let indexLoadPromise: Promise<{ sets: Record<string, CatalogSetIndexEntry>; match: MatchIndex }> | null = null;
+let namesPromise: Promise<Record<string, string>> | null = null;
+let aliases: Record<string, string> = {};
+let molds: Record<string, string> = {};
+const setPartsShardCache = new Map<string, Record<string, SetPartRow[]>>();
+const setPartsShardPromises = new Map<string, Promise<Record<string, SetPartRow[]>>>();
 
 export function clearCatalogCache() {
   colors = null;
-  setsIndexCache = null;
-  partsCache = null;
   colorsLoadPromise = null;
   indexLoadPromise = null;
+  namesPromise = null;
+  aliases = {};
+  molds = {};
   setPartsShardCache.clear();
   setPartsShardPromises.clear();
 }
@@ -54,8 +59,32 @@ export function isCatalogReady(): boolean {
   return colors !== null;
 }
 
+// Strip printed/pattern/assembly/sub-part suffixes from a part number, keeping
+// the numeric base (with optional mold letter): "3001pr0002" -> "3001",
+// "3626cpr0001" -> "3626c", BrickLink's "39367pb01" -> "39367". IDs without a
+// numeric base (e.g. "cardupn0015pr0001") are returned unchanged — they must
+// never collapse to an empty string (FIND-030). Mirrors the catalog generator.
+export function getBasePartNum(partNum: string): string {
+  const match = partNum.match(/^(\d+[a-z]?)(?:pr|pat|pb|c|sp)\d.*$/i);
+  return match ? match[1] : partNum;
+}
+
+// The part group used for matching: mold variants, alternates, prints and
+// patterns share one canonical ID. Before the index loads this is the base part.
+export function canonicalPart(partNum: string): string {
+  const base = getBasePartNum(partNum);
+  return aliases[base] ?? base;
+}
+
+// The same physical part (mold variants and prints, but not alternates such as
+// friction vs. smooth pins): pieces in one mold group may be recolored to each other.
+export function moldGroup(partNum: string): string {
+  const base = getBasePartNum(partNum);
+  return molds[base] ?? base;
+}
+
 // Load colors separately so the camera color analyzer is not blocked by the
-// (much larger) sets/parts downloads.
+// (much larger) matching downloads.
 export function loadColors(): Promise<Record<number, CatalogColor>> {
   if (colorsLoadPromise) return colorsLoadPromise;
 
@@ -75,30 +104,48 @@ export function loadColors(): Promise<Record<number, CatalogColor>> {
   return colorsLoadPromise;
 }
 
-// Load the lightweight matching data (set index + base-part index).
+function buildMatchIndex(data: { sets: string[]; parts: Record<string, number[]>; aliases?: Record<string, string>; molds?: Record<string, string> }): MatchIndex {
+  const setCount = data.sets.length;
+  const idfByPart = new Map<string, number>();
+  const setWeights = new Float64Array(setCount);
+  for (const part in data.parts) {
+    const postings = data.parts[part];
+    const weight = Math.log(1 + setCount / Math.max(1, postings.length / 2));
+    idfByPart.set(part, weight);
+    for (let i = 0; i < postings.length; i += 2) setWeights[postings[i]] += weight * postings[i + 1];
+  }
+  // A part no set contains still counts toward the pile as maximally rare.
+  const unseen = Math.log(1 + setCount);
+  return {
+    setNums: data.sets,
+    parts: data.parts,
+    aliases: data.aliases ?? {},
+    molds: data.molds ?? {},
+    idf: (canonical) => idfByPart.get(canonical) ?? unseen,
+    setWeights
+  };
+}
+
+// Load the matching data (set index + full-inventory part index).
 // A failed load resets the cached promise so a later call can retry.
-export function loadCatalogIndex(): Promise<{ sets: Record<string, CatalogSetIndexEntry>; parts: Record<string, CatalogPartInfo> }> {
+export function loadCatalogIndex(): Promise<{ sets: Record<string, CatalogSetIndexEntry>; match: MatchIndex }> {
   if (indexLoadPromise) return indexLoadPromise;
 
   indexLoadPromise = (async () => {
     const colorsPromise = loadColors();
-
-    const [setsRes, partsRes] = await Promise.all([
+    const [setsRes, matchRes] = await Promise.all([
       fetch("/catalog/sets-index.json"),
-      fetch("/catalog/parts.json")
+      fetch("/catalog/match-index.json")
     ]);
-
-    if (!setsRes.ok || !partsRes.ok) {
-      throw new Error("Failed to load sets-index or parts JSON files");
+    if (!setsRes.ok || !matchRes.ok) {
+      throw new Error("Failed to load sets-index or match-index JSON files");
     }
-
-    const [sets, parts] = await Promise.all([setsRes.json(), partsRes.json()]);
+    const [sets, matchData] = await Promise.all([setsRes.json(), matchRes.json()]);
     await colorsPromise;
-
-    setsIndexCache = sets;
-    partsCache = parts;
-
-    return { sets: setsIndexCache!, parts: partsCache! };
+    const match = buildMatchIndex(matchData);
+    aliases = match.aliases;
+    molds = match.molds;
+    return { sets, match };
   })();
 
   indexLoadPromise.catch(() => {
@@ -121,15 +168,19 @@ export async function loadCatalogMeta(): Promise<{ version: string } | null> {
   }
 }
 
-// Shard key must mirror scripts/generate-local-catalog.ts (shardKeyForSet).
+// FNV-1a hash into 512 shards. Must mirror scripts/generate-local-catalog.ts (shardKeyForSet).
 export function shardKeyForSet(setNum: string): string {
-  const normalized = setNum.toLowerCase().replace(/[^a-z0-9]/g, "");
-  return normalized.slice(0, 2) || "misc";
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < setNum.length; i++) {
+    hash ^= setNum.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return ((hash >>> 0) % 512).toString(16).padStart(3, "0");
 }
 
-// Lazily load the diagnostic part list of a single set from its shard file.
+// Lazily load the full part list of a single set from its shard file.
 // A failed load resets the shard promise so a later call can retry.
-export function loadSetParts(setNum: string): Promise<CatalogSetPart[]> {
+export function loadSetParts(setNum: string): Promise<SetPartRow[]> {
   const shard = shardKeyForSet(setNum);
 
   const cached = setPartsShardCache.get(shard);
@@ -144,7 +195,7 @@ export function loadSetParts(setNum: string): Promise<CatalogSetPart[]> {
       }
       const data = await res.json();
       setPartsShardCache.set(shard, data);
-      return data as Record<string, CatalogSetPart[]>;
+      return data as Record<string, SetPartRow[]>;
     })();
     shardPromise.catch(() => {
       setPartsShardPromises.delete(shard);
@@ -155,10 +206,43 @@ export function loadSetParts(setNum: string): Promise<CatalogSetPart[]> {
   return shardPromise.then((data) => data[setNum] || []);
 }
 
+// Part names for checklists, loaded once on first use. Never rejects.
+export function loadPartNames(): Promise<Record<string, string>> {
+  namesPromise ??= fetch("/catalog/part-names.json")
+    .then((res) => (res.ok ? res.json() : {}))
+    .catch(() => {
+      namesPromise = null;
+      return {};
+    });
+  return namesPromise;
+}
+
+// Part categories: names by ID, and the category of every part used in a set.
+// Loaded once on first use; never rejects.
+let categoriesPromise: Promise<{ names: Record<number, string>; parts: Record<string, number> }> | null = null;
+export function loadPartCategories(): Promise<{ names: Record<number, string>; parts: Record<string, number> }> {
+  categoriesPromise ??= fetch("/catalog/part-categories.json")
+    .then((res) => (res.ok ? res.json() : { names: {}, parts: {} }))
+    .catch(() => {
+      categoriesPromise = null;
+      return { names: {}, parts: {} };
+    });
+  return categoriesPromise;
+}
+
 // Resolve a part's real English catalogue name (REQ-RAD-006: never the raw ID as name).
-// Falls back to "Part <id>" only if the catalog lacks a name (e.g. pre-regeneration data).
-export function resolvePartName(part: { p: string; nm?: string | null }): string {
-  return part.nm && part.nm.trim() ? part.nm.trim() : `Part ${part.p}`;
+export function resolvePartName(partNum: string, names: Record<string, string>): string {
+  const name = names[partNum]?.trim();
+  return name || `Part ${partNum}`;
+}
+
+export function partImageUrl(image: string): string {
+  if (!image) return "";
+  return image.startsWith("https://") ? image : IMG_PREFIX + image;
+}
+
+export function setImageUrl(setNum: string, entry: CatalogSetIndexEntry): string {
+  return entry.i ?? `https://cdn.rebrickable.com/media/sets/${setNum.toLowerCase()}.jpg`;
 }
 
 // Resolve color details from the reactive catalog colors or the built-in fallback.
